@@ -12,6 +12,7 @@ Các hàm compose được copy nguyên logic từ flow2api src/main.py:632-957 
 
 import asyncio
 import base64
+import json
 import logging
 import mimetypes
 import re
@@ -173,6 +174,66 @@ def _model_reference_supported(mode: str, base: str) -> bool:
     )
 
 
+def _compose_video_frames_request(
+    base: str, length: int | None, res: str | None, ratio: str
+) -> tuple[str, dict] | None:
+    """Compose key i2v (Frames to Video — 1-2 ảnh làm frame đầu/cuối).
+
+    Chỉ lite (veo_3_1_i2v_lite*) và quality (veo_3_1_i2v_s*) có i2v trong
+    catalog; fast/fast-ultra không có → None. Key lite có suffix orientation,
+    key quality không (resolver tự map từ generationConfig.aspectRatio).
+    """
+    if base.endswith("_lite"):
+        family = "veo_3_1_i2v_lite"
+        forms = [f"{family}_{_playground_orientation(ratio)}", family]
+    elif base == "veo_3_1_t2v":
+        family = "veo_3_1_i2v_s"
+        forms = [family]
+    else:
+        return None
+    upsampling = res.lower() if res and res.lower() in ("1080p", "4k") else None
+    for form in forms:
+        candidates = []
+        if upsampling and length:
+            candidates += [f"{form}_{upsampling}_{length}s", f"{form}_{length}s_{upsampling}"]
+        if length:
+            candidates += [f"{form}_{length}s"]
+        if upsampling:
+            candidates += [f"{form}_{upsampling}"]
+        candidates.append(form)
+        for key in candidates:
+            entry = MODEL_CONFIG.get(key)
+            if entry and entry.get("type") == "video" and entry.get("video_type") == "i2v":
+                return key, {"aspectRatio": ratio}
+    return None
+
+
+def _video_frames_supported(base: str) -> bool:
+    # Probe không có length lẫn với các length chuẩn — quality (i2v_s) chỉ
+    # tồn tại key khi có suffix duration.
+    for length in (None, *PLAYGROUND_LENGTHS):
+        if any(
+            _compose_video_frames_request(base, length, None, ratio) is not None
+            for ratio in PLAYGROUND_VIDEO_RATIOS
+        ):
+            return True
+    return False
+
+
+def _compose_video_extend_request(ratio: str) -> tuple[str, dict] | None:
+    """Compose key extend (nối tiếp video qua extend://MEDIA_ID).
+
+    Upstream chỉ có 1 model extend: key landscape là ``veo_3_1_extend``
+    (model_key nội bộ mới mang suffix), portrait là ``veo_3_1_extend_portrait``.
+    """
+    orientation = _playground_orientation(ratio)
+    for key in (f"veo_3_1_extend_{orientation}", "veo_3_1_extend"):
+        entry = MODEL_CONFIG.get(key)
+        if entry and entry.get("type") == "video" and entry.get("video_type") == "extend":
+            return key, {"aspectRatio": ratio}
+    return None
+
+
 def _playground_image_model_options() -> list[dict]:
     models = []
     for spec in PLAYGROUND_IMAGE_MODELS:
@@ -230,7 +291,10 @@ def _playground_video_model_options() -> list[dict]:
                 # res=None nghĩa là model không có lựa chọn upsampling nào.
                 "res": [PLAYGROUND_VIDEO_BASE_RES, *upsampling] if upsampling else None,
                 "length": lengths or None,
+                # refs = ingredients (r2v, tối đa 3 ảnh); frames = i2v frame
+                # đầu/cuối (1-2 ảnh) — catalog chỉ có i2v cho lite + quality.
                 "refs": _model_reference_supported("video", base),
+                "frames": _video_frames_supported(base),
             }
         )
     return models
@@ -246,28 +310,50 @@ def playground_gen_options() -> dict:
 def validate_generate_payload(payload: dict) -> dict:
     """Validate payload generate từ frontend; trả params dict cho job nền.
 
-    (Adapt từ _validate_playground_generate_payload — cap references theo mode.)
+    vmode cho video: 'text' (t2v) / 'frames' (i2v 1-2 ảnh đầu+cuối) /
+    'ingredients' (r2v 1-3 ảnh tham chiếu) / 'extend' (nối tiếp video đã tạo).
     """
     from fastapi import HTTPException
 
     references = [str(ref).strip() for ref in (payload.get("references") or []) if str(ref).strip()]
-    vmode = (payload.get("vmode") or "frames").strip().lower() or "frames"
-    if vmode not in ("frames", "ingredients"):
+    vmode = (payload.get("vmode") or "text").strip().lower() or "text"
+    valid_vmodes = ("text", "frames", "ingredients", "extend")
+    if vmode not in valid_vmodes:
         raise HTTPException(
-            status_code=400, detail="Chế độ generation không hợp lệ, chỉ hỗ trợ 'frames'/'ingredients'."
+            status_code=400,
+            detail=f"Chế độ generation không hợp lệ, chỉ hỗ trợ: {', '.join(valid_vmodes)}.",
         )
     mode = (payload.get("mode") or "").strip().lower()
     if mode not in ("image", "video"):
         raise HTTPException(status_code=400, detail="Mode phải là 'image' hoặc 'video'.")
-    if mode == "video" and references and vmode != "ingredients":
-        raise HTTPException(
-            status_code=400,
-            detail="Video dùng ảnh tham chiếu cần chế độ 'ingredients'.",
-        )
-    if vmode == "ingredients" and not references:
-        raise HTTPException(
-            status_code=400, detail="Chế độ ingredients cần chọn ít nhất 1 ảnh tham chiếu."
-        )
+    if mode == "image" and vmode != "text":
+        vmode = "text"  # image luôn "text" — refs đi kèm i2i, không dùng vmode
+
+    if mode == "video":
+        if vmode == "text" and references:
+            raise HTTPException(
+                status_code=400,
+                detail="Chế độ Text không dùng ảnh — hãy chuyển sang Frames/Ingredients.",
+            )
+        if vmode == "frames" and not 1 <= len(references) <= 2:
+            raise HTTPException(
+                status_code=400,
+                detail="Chế độ Frames cần chọn đúng 1-2 ảnh (frame đầu, frame cuối).",
+            )
+        if vmode == "ingredients" and not 1 <= len(references) <= 3:
+            raise HTTPException(
+                status_code=400,
+                detail="Chế độ Ingredients cần chọn 1-3 ảnh tham chiếu.",
+            )
+        if vmode == "extend":
+            if references:
+                raise HTTPException(
+                    status_code=400, detail="Chế độ Extend không dùng ảnh tham chiếu."
+                )
+            if not str(payload.get("extend_item_id") or "").strip():
+                raise HTTPException(
+                    status_code=400, detail="Chế độ Extend cần chọn video gốc để nối tiếp."
+                )
 
     max_refs = MAX_REFERENCE_IMAGES.get(mode, 3)
     if len(references) > max_refs:
@@ -283,49 +369,65 @@ def validate_generate_payload(payload: dict) -> dict:
     qty = payload.get("qty") if payload.get("qty") is not None else 1
     if not 1 <= qty <= 4:
         raise HTTPException(status_code=400, detail="Số lượng phải từ 1 đến 4.")
+    if vmode == "extend" and qty != 1:
+        raise HTTPException(status_code=400, detail="Extend chỉ hỗ trợ 1 kết quả mỗi lần.")
 
     options = playground_gen_options()
     spec_entry = next(
         (item for item in options[mode]["models"] if item["id"] == payload.get("model")), None
     )
-    if spec_entry is None:
+    if spec_entry is None and vmode != "extend":
         raise HTTPException(status_code=400, detail="Model không được hỗ trợ cho chế độ này.")
-    spec = _playground_model_spec(mode, payload["model"])
-
-    # Model phải quảng bá hỗ trợ tham chiếu (gen-options) mới cho phép.
-    if references and not spec_entry.get("refs"):
-        raise HTTPException(status_code=400, detail="Model này không hỗ trợ ảnh tham chiếu.")
+    spec = _playground_model_spec(mode, payload.get("model")) if spec_entry else None
 
     ratio = (payload.get("ratio") or "").strip()
-    if ratio not in spec_entry["ratios"]:
+    if spec_entry is not None and ratio not in spec_entry["ratios"]:
         raise HTTPException(
             status_code=400, detail="Tỉ lệ khung hình không được hỗ trợ cho model này."
         )
+    if vmode == "extend" and ratio not in PLAYGROUND_VIDEO_RATIOS:
+        raise HTTPException(status_code=400, detail="Extend hỗ trợ tỉ lệ 16:9 hoặc 9:16.")
 
     # res/length không quảng bá cho model hiện tại → degrade về mặc định
     # thay vì để resolver fail.
     res = (payload.get("res") or "").strip() or None
-    if res is not None and res not in (spec_entry["res"] or []):
+    if spec_entry is not None and res is not None and res not in (spec_entry["res"] or []):
         res = None
     if mode == "image" and not res:
         res = "1K"
     length = payload.get("length")
-    if length is not None and length not in (spec_entry["length"] or []):
+    if (
+        spec_entry is not None
+        and length is not None
+        and length not in (spec_entry["length"] or [])
+    ):
         length = None
 
-    # Video + tham chiếu: probe key r2v thật với combo đã degrade — không có
-    # key phù hợp thì chặn sớm thay vì để job chạy rồi mới lỗi.
-    if mode == "video" and references:
+    # Probe key compose thật với combo đã degrade — không có key phù hợp thì
+    # chặn sớm thay vì để job chạy rồi mới lỗi.
+    if mode == "video" and vmode == "frames":
+        if not spec_entry.get("frames"):
+            raise HTTPException(
+                status_code=400, detail="Model này không hỗ trợ Frames to Video (i2v)."
+            )
+        if _compose_video_frames_request(spec["base"], length, res, ratio) is None:
+            raise HTTPException(
+                status_code=400, detail="Model này không hỗ trợ tổ hợp Frames đã chọn."
+            )
+    if mode == "video" and vmode == "ingredients":
+        if not spec_entry.get("refs"):
+            raise HTTPException(
+                status_code=400, detail="Model này không hỗ trợ ảnh tham chiếu."
+            )
         if _compose_video_reference_request(spec["base"], length, res, ratio) is None:
             raise HTTPException(
-                status_code=400,
-                detail="Model này không hỗ trợ tổ hợp ảnh tham chiếu đã chọn.",
+                status_code=400, detail="Model này không hỗ trợ tổ hợp ảnh tham chiếu đã chọn."
             )
 
     return {
         "mode": mode,
-        "model": payload["model"],
-        "base": spec["base"],
+        "model": payload.get("model") or "",
+        "base": spec["base"] if spec else f"veo_3_1_extend",
         "ratio": ratio,
         "res": res,
         "length": length,
@@ -333,6 +435,7 @@ def validate_generate_payload(payload: dict) -> dict:
         "prompt": prompt,
         "vmode": vmode,
         "references": references,
+        "extend_item_id": str(payload.get("extend_item_id") or "").strip() or None,
     }
 
 
@@ -463,6 +566,63 @@ class FlowClient:
             raise RuntimeError(_payload_error_message(payload))
         return payload
 
+    async def generate_stream(self, api_key: str, body: dict) -> dict:
+        """POST /v1/chat/completions stream:true — gom SSE chunk, trả kết quả.
+
+        Chunk cuối của video chứa ``<video src='...' data-media-id='...'>`` —
+        media id này cần lưu lại để hỗ trợ Extend. Trả dict:
+        ``{"url": str|None, "media_id": str|None, "text": str}``.
+        """
+        media_id_re = re.compile(r"data-media-id=['\"]([^'\"]+)['\"]")
+        chunks: list[str] = []
+        async with self._client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json=body,
+            headers={"Authorization": f"Bearer {api_key}"},
+        ) as response:
+            if response.status_code >= 400:
+                raw = (await response.aread()).decode("utf-8", errors="replace")
+                try:
+                    payload = json.loads(raw)
+                except ValueError:
+                    payload = {"result": raw[:2000]}
+                raise RuntimeError(_payload_error_message(payload))
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    payload = json.loads(data)
+                except ValueError:
+                    continue
+                choices = payload.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    chunks.append(content)
+        full = "".join(chunks)
+        url = None
+        video_match = HTML_VIDEO_RE.search(full)
+        if video_match:
+            url = video_match.group(1).strip()
+        else:
+            image_match = MARKDOWN_IMAGE_RE.search(full)
+            if image_match:
+                url = image_match.group(1).strip()
+        media_id = None
+        media_match = media_id_re.search(full)
+        if media_match:
+            media_id = media_match.group(1).strip()
+        if not url:
+            raise RuntimeError(f"Không lấy được URL từ kết quả stream: {full[-200:]}")
+        return {"url": url, "media_id": media_id, "text": full[-500:]}
+
     async def download_media(self, url: str) -> tuple[bytes, str]:
         """Tải media bytes; trả (bytes, ext có dấu chấm, vd '.jpg')."""
         if url.startswith("/"):
@@ -487,41 +647,63 @@ flow_client = FlowClient()
 
 
 def _compose_chat_body(params: dict, reference_data_urls: list[str]) -> tuple[str, dict]:
-    """params đã validate → (model alias, body JSON cho /v1/chat/completions)."""
+    """params đã validate → (model alias, body JSON cho /v1/chat/completions).
+
+    Video chạy stream:true để bắt mediaGenerationId từ chunk cuối (cần cho
+    Extend); non-stream không trả media id.
+    """
     mode = params["mode"]
+    vmode = params.get("vmode") or "text"
+    stream = mode == "video"
     if mode == "image":
         res = (params.get("res") or "1K").lower()
         request_model = params["base"]
         gen_config = {"aspectRatio": params["ratio"], "imageSize": res}
+    elif vmode == "extend":
+        composed = _compose_video_extend_request(params["ratio"])
+        if composed is None:
+            raise RuntimeError("Extend không hỗ trợ tỉ lệ khung hình đã chọn.")
+        request_model, gen_config = composed
+    elif vmode == "frames":
+        composed = _compose_video_frames_request(
+            params["base"], params["length"], params["res"], params["ratio"]
+        )
+        if composed is None:
+            raise RuntimeError("Model không hỗ trợ tổ hợp Frames đã chọn.")
+        request_model, gen_config = composed
+    elif vmode == "ingredients":
+        composed = _compose_video_reference_request(
+            params["base"], params["length"], params["res"], params["ratio"]
+        )
+        if composed is None:
+            raise RuntimeError("Model không hỗ trợ tổ hợp ảnh tham chiếu đã chọn.")
+        request_model, gen_config = composed
     else:
-        if reference_data_urls:
-            composed = _compose_video_reference_request(
-                params["base"], params["length"], params["res"], params["ratio"]
-            )
-        else:
-            composed = _compose_video_request(
-                params["base"], params["length"], params["res"], params["ratio"]
-            )
+        composed = _compose_video_request(
+            params["base"], params["length"], params["res"], params["ratio"]
+        )
         if composed is None:
             raise RuntimeError("Model không hỗ trợ tổ hợp tham số đã chọn.")
         request_model, gen_config = composed
+
+    parts: list | str = [{"type": "text", "text": params["prompt"]}]
     if reference_data_urls:
         # Ảnh tham chiếu nối vào message dưới dạng image_url data URL —
         # flow2api _normalize_openai_request tự decode thành bytes upload
-        # như IMAGE_INPUT_TYPE_REFERENCE (i2i) / r2v inputs.
-        content: list | str = [
-            {"type": "text", "text": params["prompt"]},
-            *(
-                {"type": "image_url", "image_url": {"url": url}}
-                for url in reference_data_urls
-            ),
-        ]
-    else:
-        content = params["prompt"]
+        # (i2v frame đầu/cuối, r2v ingredients, i2i ảnh tham chiếu).
+        parts.extend({"type": "image_url", "image_url": {"url": url}} for url in reference_data_urls)
+    if vmode == "extend":
+        parts.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"extend://{params['extend_media_id']}"},
+            }
+        )
+    content = params["prompt"] if (mode == "image" or not parts[1:]) else parts
     body = {
         "model": request_model,
         "messages": [{"role": "user", "content": content}],
-        "stream": False,
+        "stream": stream,
         "generationConfig": gen_config,
     }
     return request_model, body
@@ -580,7 +762,8 @@ async def _finalize_image(url: str, params: dict) -> dict:
 
 
 async def _finalize_video(url: str, params: dict) -> dict:
-    """Tải video về; crop viền WM nếu bật + model lite; lưu tmp local.
+    """Tải video về; crop viền WM nếu bật + model lite (hoặc extend từ lite);
+    lưu tmp local kèm mediaGenerationId (nếu có) để hỗ trợ Extend.
 
     Tải không được (CDN chặn, hết hạn...) thì giữ nguyên URL gốc như hành vi cũ.
     """
@@ -590,8 +773,11 @@ async def _finalize_video(url: str, params: dict) -> dict:
         logger.warning("Không tải được video về local, giữ URL gốc: %s", exc)
         return _media_item("video", url, params["meta"])
 
+    should_crop = WATERMARK_ENABLED and (
+        "lite" in str(params["base"]) or params.get("crop_like_lite")
+    )
     status = "skipped:disabled"
-    if WATERMARK_ENABLED and "lite" in str(params["base"]):
+    if should_crop:
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         filename = f"{uuid.uuid4().hex}{ext}"
         local_path = RESULTS_DIR / filename
@@ -611,7 +797,11 @@ async def _finalize_video(url: str, params: dict) -> dict:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     filename = f"{uuid.uuid4().hex}{ext}"
     (RESULTS_DIR / filename).write_bytes(raw)
-    return _media_item("video", f"/tmp/playground_results/{filename}", params["meta"])
+    item = _media_item("video", f"/tmp/playground_results/{filename}", params["meta"])
+    if params.get("media_generation_id"):
+        # Media id của video gốc trên Flow — cần để Nối tiếp (Extend).
+        item["meta"]["media_generation_id"] = params["media_generation_id"]
+    return item
 
 
 async def _generate_single_playground_item(params: dict, api_key: str) -> dict:
@@ -623,14 +813,9 @@ async def _generate_single_playground_item(params: dict, api_key: str) -> dict:
 
     request_model, body = _compose_chat_body(params, reference_data_urls)
     logger.info(
-        "Generation → flow2api model=%s mode=%s refs=%d",
-        request_model, params["mode"], len(reference_data_urls),
+        "Generation → flow2api model=%s mode=%s vmode=%s refs=%d",
+        request_model, params["mode"], params.get("vmode"), len(reference_data_urls),
     )
-    payload = await flow_client.generate(api_key, body)
-    url = _extract_url_from_openai_payload(payload)
-    if not url:
-        raise RuntimeError(_payload_error_message(payload))
-
     meta = {
         "mode": params["mode"],
         "model": params["model"],
@@ -638,6 +823,21 @@ async def _generate_single_playground_item(params: dict, api_key: str) -> dict:
         "res": params["res"],
         "length": params["length"],
     }
+    if params.get("vmode") == "extend":
+        meta["model"] = "veo-3.1-extend"
+        meta["extend_source_item"] = params.get("extend_item_id")
+
+    if params["mode"] == "video":
+        # Video chạy stream:true — chunk cuối mang mediaGenerationId cần cho Extend.
+        streamed = await flow_client.generate_stream(api_key, body)
+        url = streamed["url"]
+        meta["media_generation_id"] = streamed["media_id"]
+    else:
+        payload = await flow_client.generate(api_key, body)
+        url = _extract_url_from_openai_payload(payload)
+        if not url:
+            raise RuntimeError(_payload_error_message(payload))
+
     item_params = dict(params)
     item_params["meta"] = meta
     if params["mode"] == "image":

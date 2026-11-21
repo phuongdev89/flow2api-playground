@@ -1,5 +1,9 @@
 # Engine LaMa (tùy chọn, chất lượng inpaint cao hơn OpenCV TELEA).
-# Cài: pip install -r requirements-lama.txt — lần đầu chạy sẽ tải big-lama.pt
-# (~200MB) về TORCH_HUB_CACHE, mount volume để giữ cache qua các lần restart.
+# Cài cho Linux — dùng bản CPU-only để tránh CUDA bloat ~6-9GB:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   pip install simple-lama-inpainting
+# (Dockerfile đã làm sẵn các bước này khi WITH_WATERMARK_TOOLS=1.)
+# Lần đầu chạy sẽ tải big-lama.pt (~200MB) về TORCH_HUB_CACHE — mount volume
+# để giữ cache qua các lần restart.
 simple-lama-inpainting>=0.1.2
 torch>=2.2

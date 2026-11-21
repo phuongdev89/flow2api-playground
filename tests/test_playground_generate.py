@@ -120,7 +120,13 @@ def test_gen_options_shape_and_base_field(playground_client):
     video_ids = [model["id"] for model in payload["video"]["models"]]
     assert video_ids == ["veo-3.1-lite", "veo-3.1-fast", "veo-3.1-fast-ultra", "veo-3.1-quality"]
     for model in payload["video"]["models"]:
-        assert set(model) == {"id", "label", "base", "ratios", "res", "length", "refs"}
+        assert set(model) == {"id", "label", "base", "ratios", "res", "length", "refs", "frames"}
+    # i2v chỉ có trong catalog cho lite + quality (fast/fast-ultra không có)
+    by_id = {m["id"]: m for m in payload["video"]["models"]}
+    assert by_id["veo-3.1-lite"]["frames"] is True
+    assert by_id["veo-3.1-quality"]["frames"] is True
+    assert by_id["veo-3.1-fast"]["frames"] is False
+    assert by_id["veo-3.1-fast-ultra"]["frames"] is False
 
 
 # ── 2. Cap ảnh tham chiếu: image 10 / video 3 ────────────────────────
@@ -258,7 +264,14 @@ def test_generate_endpoint_validates_payload(playground_client):
         {**_GOOD_BODY, "model": "veo-9.9"},
         {**_GOOD_BODY, "model": "veo-3.1-lite"},
         {**_GOOD_BODY, "ratio": "21:9"},
-        {**_GOOD_BODY, "vmode": "ingredients"},
+        {**_GOOD_BODY, "vmode": "nonsense"},
+        # Frames cần 1-2 ảnh; không có ảnh → 400
+        {**_GOOD_BODY, "mode": "video", "model": "veo-3.1-lite", "length": 8, "vmode": "frames"},
+        # Extend cần extend_item_id
+        {**_GOOD_BODY, "mode": "video", "model": "veo-3.1-lite", "length": 8, "vmode": "extend"},
+        # Extend qty != 1
+        {**_GOOD_BODY, "mode": "video", "model": "veo-3.1-lite", "length": 8,
+         "vmode": "extend", "extend_item_id": "v1", "qty": 2},
     ]
     for body in cases:
         response = client.post(url, json=body, headers=headers)
@@ -344,3 +357,64 @@ def test_watermark_mask_api_roundtrip(playground_client):
     assert deleted.status_code == 204
     listing = client.get("/playground/api/watermark").json()
     assert not any(mask["key"] == key for mask in listing["masks"])
+
+
+# ── 6. Stream SSE parsing (video) — mediaGenerationId cho Extend ─────────
+
+
+def test_generate_stream_parses_url_and_media_id(monkeypatch):
+    import httpx
+    from app.generation import flow_client
+
+    sse_body = "\n".join(
+        [
+            'data: {"choices":[{"delta":{"content":"Đang tạo video…"}}]}',
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<video src='/tmp/qa.mp4' data-media-id='ab12cd34-5678-90ab-cdef-112233445566' controls></video>\",\"finish_reason\":\"stop\"}}]}",
+            "data: [DONE]",
+            "",
+        ]
+    )
+
+    def handler(request):
+        return httpx.Response(
+            200, text=sse_body, headers={"content-type": "text/event-stream"}
+        )
+
+    original_client = flow_client._client
+    flow_client._client = httpx.AsyncClient(
+        base_url="http://flow.test", transport=httpx.MockTransport(handler)
+    )
+    try:
+        result = asyncio.run(flow_client.generate_stream("key", {"stream": True}))
+    finally:
+        flow_client._client = original_client
+    assert result["url"] == "/tmp/qa.mp4"
+    assert result["media_id"] == "ab12cd34-5678-90ab-cdef-112233445566"
+
+    # Không có video tag → báo lỗi rõ (không treo job)
+    def empty_handler(request):
+        return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"err"}}]}\ndata: [DONE]\n', headers={"content-type": "text/event-stream"})
+
+    flow_client._client = httpx.AsyncClient(
+        base_url="http://flow.test", transport=httpx.MockTransport(empty_handler)
+    )
+    try:
+        with pytest.raises(RuntimeError, match="Không lấy được URL"):
+            asyncio.run(flow_client.generate_stream("key", {"stream": True}))
+    finally:
+        flow_client._client = original_client
+
+
+def test_compose_frames_and_extend_requests():
+    from app import generation as g
+    # lite: i2v có cả hai thứ tự suffix — probe phải tìm được key
+    alias, _ = g._compose_video_frames_request("veo_3_1_t2v_lite", 8, None, "9:16")
+    assert alias == "veo_3_1_i2v_lite_portrait_8s"
+    # quality: key i2v_s cần suffix duration
+    alias_q, _ = g._compose_video_frames_request("veo_3_1_t2v", 6, None, "16:9")
+    assert alias_q == "veo_3_1_i2v_s_6s"
+    # fast không có i2v
+    assert g._compose_video_frames_request("veo_3_1_t2v_fast", 8, None, "16:9") is None
+    # extend: landscape key không có suffix, portrait có
+    assert g._compose_video_extend_request("16:9")[0] == "veo_3_1_extend"
+    assert g._compose_video_extend_request("9:16")[0] == "veo_3_1_extend_portrait"

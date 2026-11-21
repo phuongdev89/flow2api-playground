@@ -77,10 +77,10 @@ const GEN_OPTIONS = {
   video: {
     ratios: ['16:9', '9:16'],
     models: [
-      { id: 'veo-3.1-lite', label: 'Veo 3.1 - Lite', refs: true },
-      { id: 'veo-3.1-fast', label: 'Veo 3.1 - Fast', res: ['720p', '1080p', '4K'], length: [4, 8], refs: true },
-      { id: 'veo-3.1-fast-ultra', label: 'Veo 3.1 Fast Ultra', res: ['720p', '1080p', '4K'], length: [4, 8], refs: true },
-      { id: 'veo-3.1-quality', label: 'Veo 3.1 - Quality', res: ['720p', '1080p', '4K'], length: [4, 8], refs: false },
+      { id: 'veo-3.1-lite', label: 'Veo 3.1 - Lite', refs: true, frames: true },
+      { id: 'veo-3.1-fast', label: 'Veo 3.1 - Fast', res: ['720p', '1080p', '4K'], length: [4, 8], refs: true, frames: false },
+      { id: 'veo-3.1-fast-ultra', label: 'Veo 3.1 Fast Ultra', res: ['720p', '1080p', '4K'], length: [4, 8], refs: true, frames: false },
+      { id: 'veo-3.1-quality', label: 'Veo 3.1 - Quality', res: ['720p', '1080p', '4K'], length: [4, 8], refs: false, frames: true },
     ],
   },
 };
@@ -88,7 +88,7 @@ let GEN_CAPS = null; // merged /playground/api/gen-options capability; static GE
 const genState = {
   mode: 'image',
   image: { model: 'nano-banana-pro', ratio: '9:16', qty: 1, res: '1K' },
-  video: { model: 'veo-3.1-lite', vmode: 'frames', ratio: '9:16', qty: 1, res: '720p', length: 8 },
+  video: { model: 'veo-3.1-lite', vmode: 'text', ratio: '9:16', qty: 1, res: '720p', length: 8 },
 };
 let genModelListOpen = false;
 
@@ -308,9 +308,30 @@ function selectedImageItems() {
 }
 
 function selectionChanged() {
+  applyVideoVmodeAuto();
   renderResultsGrid();
   renderComposerRefs();
   syncSelectionRoles();
+}
+
+// Auto-chọn vmode theo số ảnh đang chọn (giữ combo luôn hợp lệ):
+// 0 ảnh → Text; 1-2 ảnh → Frames (nếu model hỗ trợ); ≥3 → Ingredients.
+function applyVideoVmodeAuto() {
+  if (genState.mode !== 'video' || genState.video.vmode === 'extend') return;
+  const model = genSelectedModel('video');
+  const count = selectedImageItems().length;
+  if (count === 0) {
+    genState.video.vmode = 'text';
+    return;
+  }
+  if (genState.video.vmode === 'text' && count > 0) {
+    genState.video.vmode = count <= 2 && model?.frames === true ? 'frames'
+      : model?.refs === true ? 'ingredients' : 'text';
+    return;
+  }
+  if (genState.video.vmode === 'frames' && count > 2) {
+    genState.video.vmode = model?.refs === true ? 'ingredients' : 'frames';
+  }
 }
 
 function setSelected(itemId, selected) {
@@ -388,6 +409,15 @@ async function patchProjectItemQuiet(projectId, itemId, patch) {
 
 // ── Hàng thumb tham chiếu trong composer ─────────────────────────────────
 
+// Cap ảnh tham chiếu khả dụng theo mode + vmode hiện tại (0 = không dùng ảnh nào).
+function composerRefCap() {
+  if (genState.mode === 'image') return MAX_REFS.image;
+  const vmode = genState.video.vmode;
+  if (vmode === 'frames') return 2;
+  if (vmode === 'ingredients') return MAX_REFS.video;
+  return 0; // video Text không dùng ảnh
+}
+
 function renderComposerRefs() {
   if (!composerRefs) return;
   const items = selectedItems();
@@ -396,7 +426,7 @@ function renderComposerRefs() {
     composerRefs.replaceChildren();
     return;
   }
-  const cap = MAX_REFS[genState.mode] ?? 3;
+  const cap = composerRefCap();
   const imageCount = items.filter((item) => item.kind === 'image').length;
   const chips = items.map((item) => {
     const isImage = item.kind === 'image';
@@ -439,8 +469,13 @@ function renderComposerRefs() {
   const counter = document.createElement('span');
   counter.className = 'composer-refs-count';
   const usable = Math.min(imageCount, cap);
+  const videoLabels = {
+    text: `Text mode — ${imageCount} ảnh không dùng`,
+    frames: `Frames ${usable}/2`,
+    ingredients: `Ingredients ${usable}/3`,
+  };
   counter.textContent = genState.mode === 'video'
-    ? `Ingredients ${usable}/${cap}`
+    ? videoLabels[genState.video.vmode] ?? videoLabels.text
     : `Ảnh tham chiếu ${usable}/${cap}`;
   composerRefs.replaceChildren(counter, ...chips);
   composerRefs.hidden = false;
@@ -1134,6 +1169,7 @@ function mergeCapabilities(data) {
         res: server.res === undefined ? model.res : server.res,
         length: server.length === undefined ? model.length : server.length,
         refs: typeof server.refs === 'boolean' ? server.refs : model.refs,
+        frames: typeof server.frames === 'boolean' ? server.frames : model.frames,
       };
     });
     // Server-only models stay selectable by being appended.
@@ -1382,21 +1418,30 @@ function renderGenDialog() {
     const active = button.dataset.vmode === genState.video.vmode;
     button.classList.toggle('is-active', active);
     button.setAttribute('aria-pressed', String(active));
-    if (button.dataset.vmode === 'ingredients') {
-      // Ingredients chỉ mở khi model hỗ trợ và có ảnh đang được chọn trong stage.
-      const videoModel = genSelectedModel('video');
-      const hasRefs = selectedImageItems().length > 0;
-      const enabled = videoModel?.refs === true && hasRefs;
-      button.classList.toggle('is-disabled', !enabled);
-      if (enabled) {
-        button.removeAttribute('aria-disabled');
-        button.removeAttribute('title');
-      } else {
-        button.setAttribute('aria-disabled', 'true');
-        button.title = videoModel?.refs === false
-          ? 'Model này không hỗ trợ ảnh tham chiếu'
-          : 'Chưa có ảnh tham chiếu — bôi chọn ảnh trong stage (Ctrl/Cmd + click).';
-      }
+    const videoModel = genSelectedModel('video');
+    const imageCount = selectedImageItems().length;
+    let enabled = true;
+    let hint = '';
+    if (button.dataset.vmode === 'frames') {
+      // Frames (i2v): 1-2 ảnh làm frame đầu/cuối — chỉ model hỗ trợ i2v.
+      enabled = videoModel?.frames === true && imageCount >= 1 && imageCount <= 2;
+      hint = videoModel?.frames === false
+        ? 'Model này không hỗ trợ Frames to Video'
+        : 'Chọn 1 ảnh (frame đầu) hoặc 2 ảnh (frame đầu + cuối) trong stage.';
+    } else if (button.dataset.vmode === 'ingredients') {
+      // Ingredients chỉ mở khi model hỗ trợ và có 1-3 ảnh đang được chọn.
+      enabled = videoModel?.refs === true && imageCount >= 1 && imageCount <= 3;
+      hint = videoModel?.refs === false
+        ? 'Model này không hỗ trợ ảnh tham chiếu'
+        : 'Bôi chọn 1-3 ảnh trong stage (Ctrl/Cmd + click).';
+    }
+    button.classList.toggle('is-disabled', !enabled);
+    if (enabled) {
+      button.removeAttribute('aria-disabled');
+      button.removeAttribute('title');
+    } else {
+      button.setAttribute('aria-disabled', 'true');
+      button.title = hint;
     }
   }
   renderResImageRow();
@@ -1451,19 +1496,31 @@ for (const tab of genTabs) {
 }
 for (const button of genVmodeRow.querySelectorAll('.gen-seg-btn')) {
   button.addEventListener('click', () => {
+    const videoModel = genSelectedModel('video');
+    const imageCount = selectedImageItems().length;
+    if (button.dataset.vmode === 'frames') {
+      if (videoModel?.frames !== true) {
+        showToast('Model này không hỗ trợ Frames to Video.');
+        return;
+      }
+      if (imageCount < 1 || imageCount > 2) {
+        showToast('Chọn 1 ảnh (frame đầu) hoặc 2 ảnh (frame đầu + cuối) trong stage.');
+        return;
+      }
+    }
     if (button.dataset.vmode === 'ingredients') {
-      const videoModel = genSelectedModel('video');
       if (videoModel?.refs !== true) {
         showToast('Model này không hỗ trợ ảnh tham chiếu.');
         return;
       }
-      if (!selectedImageItems().length) {
-        showToast('Chưa có ảnh tham chiếu — bôi chọn ảnh trong stage (Ctrl/Cmd + click).');
+      if (imageCount < 1 || imageCount > 3) {
+        showToast('Chọn 1-3 ảnh tham chiếu trong stage (Ctrl/Cmd + click).');
         return;
       }
     }
     genState.video.vmode = button.dataset.vmode;
     renderGenDialog();
+    renderComposerRefs();
   });
 }
 for (const mode of ['image', 'video']) {
@@ -1485,14 +1542,16 @@ function buildGeneratePayload(promptText) {
   const state = genState[mode];
   const model = genSelectedModel(mode);
   // Ảnh tham chiếu lấy từ selection trong stage (thứ tự chọn), chỉ item ảnh
-  // còn tồn tại; cap theo mode (image 10 / video 3).
-  const cap = MAX_REFS[mode] ?? 3;
+  // còn tồn tại; cap theo mode/vmode (image 10, Frames 2, Ingredients 3).
   const selectedImages = selectedImageItems().map((item) => String(item.id));
+  const vmode = mode === 'video' ? state.vmode : 'text';
   let references = [];
   if (mode === 'image') {
-    references = model?.refs === true ? selectedImages.slice(0, cap) : [];
-  } else if (state.vmode === 'ingredients' && model?.refs === true) {
-    references = selectedImages.slice(0, cap);
+    references = model?.refs === true ? selectedImages.slice(0, MAX_REFS.image) : [];
+  } else if (vmode === 'frames' && model?.frames === true) {
+    references = selectedImages.slice(0, 2);
+  } else if (vmode === 'ingredients' && model?.refs === true) {
+    references = selectedImages.slice(0, MAX_REFS.video);
   }
   return {
     mode,
@@ -1502,8 +1561,7 @@ function buildGeneratePayload(promptText) {
     // Only send res/length the selected model actually supports.
     res: Array.isArray(model.res) && model.res.length ? state.res ?? null : null,
     length: mode === 'video' && Array.isArray(model.length) && model.length.length ? state.length : null,
-    // Video có tham chiếu → ingredients; image luôn frames (refs đi kèm i2i).
-    vmode: mode === 'video' && references.length ? 'ingredients' : 'frames',
+    vmode,
     references,
     prompt: promptText,
   };
@@ -1551,7 +1609,11 @@ async function startGeneration() {
     showToast('Đang tạo nội dung, vui lòng chờ.');
     return;
   }
-  const payload = buildGeneratePayload(promptText);
+  await launchGeneration(project, buildGeneratePayload(promptText), { clearPrompt: true });
+}
+
+// Đường chung cho generate từ composer lẫn Extend: đặt pending → POST → poll.
+async function launchGeneration(project, payload, { clearPrompt = false } = {}) {
   pendingByProject.set(project.id, {
     mode: payload.mode,
     ratio: payload.ratio,
@@ -1572,14 +1634,14 @@ async function startGeneration() {
     renderResultsGrid();
     syncComposerState();
     showToast('Không kết nối được với máy chủ.');
-    return;
+    return false;
   }
   if (response.status === 401 || response.status === 403) {
     // Session expired: back to the key screen.
     clearJobState(project.id);
     setSignedIn(false);
     keyInput.focus();
-    return;
+    return false;
   }
   if (!response.ok) {
     let message = 'Không tạo được nội dung.';
@@ -1591,7 +1653,7 @@ async function startGeneration() {
     renderResultsGrid();
     syncComposerState();
     showToast(message);
-    return;
+    return false;
   }
   let jobId = null;
   try {
@@ -1605,21 +1667,24 @@ async function startGeneration() {
     renderResultsGrid();
     syncComposerState();
     showToast('Không tạo được nội dung.');
-    return;
+    return false;
   }
   activeJobs.set(project.id, jobId);
-  // Job đã được server nhận — xoá nội dung đã gửi khỏi ô chat (kèm xoá draft
-  // phía server ở nền, không cần chờ).
-  clearTimeout(promptSaveTimer);
-  prompt.value = '';
-  project.prompt = '';
-  autoGrowPrompt();
-  syncComposerState();
-  request(projectPath(project.id), {
-    method: 'PATCH',
-    body: JSON.stringify({ prompt: '' }),
-  }).catch(() => { /* draft sync best-effort */ });
+  if (clearPrompt) {
+    // Job đã được server nhận — xoá nội dung đã gửi khỏi ô chat (kèm xoá draft
+    // phía server ở nền, không cần chờ).
+    clearTimeout(promptSaveTimer);
+    prompt.value = '';
+    project.prompt = '';
+    autoGrowPrompt();
+    syncComposerState();
+    request(projectPath(project.id), {
+      method: 'PATCH',
+      body: JSON.stringify({ prompt: '' }),
+    }).catch(() => { /* draft sync best-effort */ });
+  }
   startPolling(project.id, jobId);
+  return true;
 }
 
 sendButton.addEventListener('click', async () => {
@@ -1665,6 +1730,21 @@ document.addEventListener('keydown', (event) => {
   if (!paintEditor.hidden) {
     event.preventDefault();
     closePaintEditor();
+    return;
+  }
+  if (!maskEditor.hidden) {
+    event.preventDefault();
+    closeMaskEditor();
+    return;
+  }
+  if (!extendDialog.hidden) {
+    event.preventDefault();
+    closeExtendDialog();
+    return;
+  }
+  if (!wmModal.hidden) {
+    event.preventDefault();
+    wmModal.hidden = true;
     return;
   }
   if (!lightbox.hidden) {
@@ -1871,6 +1951,7 @@ function openResultMenuFor(toggle, item) {
   buttons.push(renameBtn);
   let paintBtn = null;
   let maskBtn = null;
+  let extendBtn = null;
   if (item.kind === 'image') {
     const isRef = item.role === 'reference';
     const refToggle = makeButton('result-menu-item', isRef ? 'Bỏ đánh dấu tham chiếu' : 'Đổi thành tham chiếu');
@@ -1879,6 +1960,10 @@ function openResultMenuFor(toggle, item) {
       maskBtn = makeButton('result-menu-item', 'Tạo mask WM từ ảnh này');
     }
     buttons.push(refToggle, paintBtn, ...(maskBtn ? [maskBtn] : []));
+  } else if (item.kind === 'video' && item.meta?.media_generation_id) {
+    // Chỉ video tạo trong playground mới có media id để nối tiếp (Extend).
+    extendBtn = makeButton('result-menu-item', 'Nối tiếp video này (Extend)');
+    buttons.push(extendBtn);
   }
   const deleteBtn = makeButton('result-menu-item is-danger', 'Xóa');
   buttons.push(deleteBtn);
@@ -1908,6 +1993,12 @@ function openResultMenuFor(toggle, item) {
         openMaskEditor(item);
       });
     }
+  }
+  if (extendBtn) {
+    extendBtn.addEventListener('click', () => {
+      closeResultMenu();
+      openExtendDialog(projectId, item);
+    });
   }
   deleteBtn.addEventListener('click', () => {
     closeResultMenu();
@@ -2288,3 +2379,72 @@ async function loadWmInfo() {
     wmEngine.textContent = 'Không tải được trạng thái watermark.';
   }
 }
+
+// ── Extend: nối tiếp video đã tạo bằng prompt ───────────────────────────────
+
+const extendDialog = document.querySelector('#extend-dialog');
+const extendForm = document.querySelector('#extend-form');
+const extendPrompt = document.querySelector('#extend-prompt');
+const extendError = document.querySelector('#extend-error');
+const extendCancel = document.querySelector('#extend-cancel');
+const extendSubmit = document.querySelector('#extend-submit');
+
+let extendState = null; // { projectId, item }
+
+function openExtendDialog(projectId, item) {
+  extendState = { projectId, item };
+  extendError.hidden = true;
+  extendPrompt.value = '';
+  extendSubmit.disabled = false;
+  const ratio = item.meta?.ratio ? ` · ${item.meta.ratio}` : '';
+  extendDialog.querySelector('#extend-title').textContent =
+    `Nối tiếp video này${ratio}`;
+  extendDialog.hidden = false;
+  extendPrompt.focus();
+}
+
+function closeExtendDialog() {
+  extendState = null;
+  extendDialog.hidden = true;
+}
+
+extendCancel.addEventListener('click', closeExtendDialog);
+extendDialog.addEventListener('click', (event) => {
+  if (event.composedPath()[0] === extendDialog) closeExtendDialog();
+});
+extendForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (!extendState || extendSubmit.disabled) return;
+  const { projectId, item } = extendState;
+  const promptText = extendPrompt.value.trim();
+  if (!promptText) {
+    extendError.textContent = 'Prompt không được để trống.';
+    extendError.hidden = false;
+    return;
+  }
+  if (jobBusy(projectId)) {
+    extendError.textContent = 'Đang có job chạy — vui lòng đợi job hiện tại xong.';
+    extendError.hidden = false;
+    return;
+  }
+  extendSubmit.disabled = true;
+  const payload = {
+    mode: 'video',
+    model: 'veo-3.1-lite',
+    ratio: item.meta?.ratio ?? '16:9',
+    qty: 1,
+    res: null,
+    length: null,
+    vmode: 'extend',
+    extend_item_id: String(item.id),
+    references: [],
+    prompt: promptText,
+  };
+  closeExtendDialog();
+  const launched = await launchGeneration(
+    projects.find(({ id }) => id === projectId),
+    payload,
+    { clearPrompt: false },
+  );
+  if (launched) showToast('Đang tạo đoạn tiếp theo…');
+});

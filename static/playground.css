@@ -840,3 +840,18 @@ h1 { min-width: 0; overflow-wrap: anywhere; font-weight: 640; }
 .wm-mask-key { font-size: 12px; overflow-wrap: anywhere; }
 .wm-mask-delete { padding: 4px 9px; border-radius: 6px; font-size: 11px; color: #ff6b6b; border: 1px solid #3a2424; background: transparent; }
 .wm-mask-delete:hover { background: #ff6b6b22; }
+
+/* ── Extend dialog ────────────────────────────────────────────────────────── */
+#extend-prompt {
+  width: 100%;
+  resize: vertical;
+  min-height: 64px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 10px;
+  background: var(--black);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.45;
+}
+#extend-prompt:focus-visible { outline: none; border-color: var(--muted); }

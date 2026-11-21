@@ -87,11 +87,15 @@
 
           <div id="gen-body-video" class="gen-body" hidden>
             <div id="gen-vmode" class="gen-seg" role="group" aria-label="Kiểu video">
-              <button class="gen-seg-btn is-active" type="button" data-vmode="frames">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"/></svg>
+              <button class="gen-seg-btn is-active" type="button" data-vmode="text">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 7V5h16v2M9 5v14M7 19h4"/></svg>
+                Text
+              </button>
+              <button class="gen-seg-btn" type="button" data-vmode="frames">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="10" height="8" rx="1.5"/><rect x="11" y="11" width="10" height="8" rx="1.5"/><path d="m6 21 4-3"/></svg>
                 Frames
               </button>
-              <button class="gen-seg-btn is-disabled" type="button" data-vmode="ingredients" aria-disabled="true" title="Cần ảnh tham chiếu — sắp ra mắt.">
+              <button class="gen-seg-btn is-disabled" type="button" data-vmode="ingredients" aria-disabled="true" title="Chưa có ảnh tham chiếu — bôi chọn ảnh trong stage.">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="12" height="12" rx="2.5"/><rect x="9" y="9" width="12" height="12" rx="2.5"/></svg>
                 Ingredients
               </button>
@@ -168,6 +172,20 @@
         <button id="wm-close" class="paint-btn is-primary" type="button">Đóng</button>
       </div>
     </div>
+  </div>
+
+  <div id="extend-dialog" class="item-dialog" role="dialog" aria-modal="true" aria-labelledby="extend-title" hidden>
+    <form id="extend-form" class="item-dialog-card wm-card">
+      <h2 id="extend-title">Nối tiếp video này</h2>
+      <p class="wm-hint">Video gốc giữ nguyên — tạo đoạn tiếp theo dựa trên nội dung nó (giống Extend trong Flow). Video mới sẽ xuất hiện như một item riêng.</p>
+      <label class="sr-only" for="extend-prompt">Prompt đoạn tiếp theo</label>
+      <textarea id="extend-prompt" rows="3" maxlength="2000" placeholder="Mô tả đoạn tiếp theo của video…" autocomplete="off"></textarea>
+      <p id="extend-error" class="item-dialog-error" role="alert" hidden></p>
+      <div class="item-dialog-actions">
+        <button id="extend-cancel" class="paint-btn" type="button">Hủy</button>
+        <button id="extend-submit" class="paint-btn is-primary" type="submit">Tạo đoạn tiếp theo</button>
+      </div>
+    </form>
   </div>
 </body>
 </html>

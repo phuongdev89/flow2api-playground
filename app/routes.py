@@ -84,6 +84,8 @@ class PlaygroundGenerateRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=100_000)
     # Danh sách id ảnh tham chiếu trong project — cap theo mode (image 10 / video 3).
     references: list[str] = Field(default_factory=list, max_length=10)
+    # vmode='extend': id của video item gốc cần nối tiếp (cần meta.media_generation_id).
+    extend_item_id: str | None = None
 
 
 class PlaygroundItemCreateRequest(BaseModel):
@@ -345,14 +347,14 @@ async def playground_generate(
             detail="Đang có quá nhiều job chạy cùng lúc — vui lòng đợi job hiện tại xong.",
         )
     params = generation.validate_generate_payload(payload.model_dump())
+    items_by_id = {
+        str(item.get("id")): item
+        for item in (project.get("results") or [])
+        if isinstance(item, dict)
+    }
     if params["references"]:
         # Resolve id tham chiếu → URL ảnh thật trong project; id lạ thì 400
         # để client kịp sửa thay vì job error lúc chạy.
-        items_by_id = {
-            str(item.get("id")): item
-            for item in (project.get("results") or [])
-            if isinstance(item, dict)
-        }
         reference_urls = []
         for ref_id in params["references"]:
             item = items_by_id.get(ref_id)
@@ -364,6 +366,23 @@ async def playground_generate(
                 )
             reference_urls.append(url)
         params["reference_urls"] = reference_urls
+    if params.get("vmode") == "extend":
+        source = items_by_id.get(params["extend_item_id"] or "")
+        media_id = (source or {}).get("meta", {}).get("media_generation_id") if source else None
+        if (
+            source is None
+            or source.get("kind") != "video"
+            or not isinstance(media_id, str)
+            or not media_id
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Video gốc không hợp lệ hoặc thiếu media id — chỉ video tạo trong "
+                "playground mới nối tiếp được.",
+            )
+        params["extend_media_id"] = media_id
+        # Video extend từ nguồn lite: đoạn mới vẫn có WM viền → crop giống lite.
+        params["crop_like_lite"] = "lite" in str((source.get("meta") or {}).get("model", ""))
 
     api_key = await playground_db.api_key_for_owner(owner_hash)
     if not api_key:
