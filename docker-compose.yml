@@ -1,0 +1,27 @@
+services:
+  playground:
+    build:
+      context: .
+      args:
+        WITH_WATERMARK_TOOLS: "1"
+    image: flow2api-playground:local
+    container_name: flow2api-playground
+    ports:
+      - "38001:8000"
+    environment:
+      # Engine generation — trỏ sang container/host flow2api đang chạy.
+      FLOW2API_BASE_URL: ${FLOW2API_BASE_URL:-http://192.168.10.132:38000}
+      WATERMARK_ENABLED: ${WATERMARK_ENABLED:-1}
+      WATERMARK_ENGINE: ${WATERMARK_ENGINE:-auto}
+      WATERMARK_VIDEO_CROP_PERCENT: ${WATERMARK_VIDEO_CROP_PERCENT:-2}
+      PLAYGROUND_MAX_RUNNING_JOBS: ${PLAYGROUND_MAX_RUNNING_JOBS:-3}
+      TORCH_HUB_CACHE: /root/.cache/torch/hub
+    volumes:
+      - ./data:/app/data
+      - ./tmp:/app/tmp
+      - ./masks:/app/masks
+      - ./app:/app/app
+      - ./static:/app/static
+      - ./main.py:/app/main.py
+      - ${TORCH_HUB_CACHE:-./data/torch/hub}:/root/.cache/torch/hub
+    restart: unless-stopped

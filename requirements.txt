@@ -1,0 +1,9 @@
+fastapi>=0.110
+uvicorn>=0.29
+httpx>=0.27
+aiosqlite>=0.20
+pydantic>=2.6
+# Watermark engine (bắt buộc để xoá WM hoạt động)
+numpy>=1.26
+opencv-python-headless>=4.8
+pillow>=10.0

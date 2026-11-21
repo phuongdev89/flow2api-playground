@@ -1,0 +1,14 @@
+# Runtime data
+data/
+tmp/
+config/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,1 @@
+"""Playground application package."""

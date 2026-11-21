@@ -1,0 +1,5 @@
+# Engine LaMa (tùy chọn, chất lượng inpaint cao hơn OpenCV TELEA).
+# Cài: pip install -r requirements-lama.txt — lần đầu chạy sẽ tải big-lama.pt
+# (~200MB) về TORCH_HUB_CACHE, mount volume để giữ cache qua các lần restart.
+simple-lama-inpainting>=0.1.2
+torch>=2.2
