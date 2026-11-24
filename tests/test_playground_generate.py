@@ -453,6 +453,55 @@ def test_compose_frames_and_extend_requests():
     assert g._compose_video_extend_request("9:16")[0] == "veo_3_1_extend_portrait"
 
 
+def test_compose_frames_request_routes_by_image_count():
+    """Lite 1 ảnh → i2v thường (min=max=1), lite 2 ảnh → interpolation
+    (min=max=2). Gửi 2 ảnh vào key i2v thường bị upstream từ chối
+    "first/last-frame model requires 1-1 images; 2 provided"."""
+    from app import generation as g
+    alias_1, _ = g._compose_video_frames_request("veo_3_1_t2v_lite", 8, None, "16:9", images=1)
+    assert alias_1 == "veo_3_1_i2v_lite_landscape_8s"
+    alias_2, gen_cfg = g._compose_video_frames_request(
+        "veo_3_1_t2v_lite", 8, None, "16:9", images=2
+    )
+    assert alias_2 == "veo_3_1_interpolation_lite_landscape_8s"
+    assert gen_cfg == {"aspectRatio": "16:9"}
+    # 4s/6s cũng có key interpolation riêng theo duration
+    assert (
+        g._compose_video_frames_request("veo_3_1_t2v_lite", 4, None, "9:16", images=2)[0]
+        == "veo_3_1_interpolation_lite_portrait_4s"
+    )
+    # quality dùng chung key i2v_s (1-2 ảnh) cho cả một lẫn hai ảnh
+    assert (
+        g._compose_video_frames_request("veo_3_1_t2v", 6, None, "16:9", images=2)[0]
+        == "veo_3_1_i2v_s_6s"
+    )
+    assert (
+        g._compose_video_frames_request("veo_3_1_t2v", 6, None, "16:9", images=1)[0]
+        == "veo_3_1_i2v_s_6s"
+    )
+
+
+def test_compose_chat_body_frames_two_images_targets_interpolation():
+    """Lite + Frames + 2 ảnh: model trong body phải là interpolation key —
+    đây chính là lỗi "requires 1-1 images; 2 provided" trước khi fix."""
+    from app import generation as g
+
+    params = {
+        "mode": "video",
+        "base": "veo_3_1_t2v_lite",
+        "ratio": "16:9",
+        "res": None,
+        "length": 8,
+        "prompt": "chuyển động mượt giữa hai frame",
+        "vmode": "frames",
+    }
+    refs = ["data:image/png;base64,aGVsbG8=", "data:image/png;base64,aGVsbG8="]
+    model, body = g._compose_chat_body(params, refs)
+    assert model == "veo_3_1_interpolation_lite_landscape_8s"
+    parts = body["messages"][0]["content"]
+    assert sum(1 for part in parts if part["type"] == "image_url") == 2
+
+
 def test_compose_chat_body_image_with_references_sends_image_parts():
     """i2i image: có ảnh tham chiếu thì content phải là parts chứa image_url —
     không được nuốt refs rồi để upstream nhận has_images=false."""
@@ -578,3 +627,132 @@ def test_single_item_extend_meta_keeps_reuse_contract(monkeypatch, tmp_path):
     assert item["meta"]["references"] == []
     assert item["meta"]["vmode"] == "extend"
     assert item["meta"]["extend_source_item"] == "item-src"
+
+
+# ── 7. Retry / Delete job lỗi ────────────────────────────────────────
+
+
+def _fail_job(database, owner, project_id, params=None, error="Upstream 500."):
+    """Tạo job rồi đánh dấu lỗi như một lượt generate thật sự thất bại."""
+    job = asyncio.run(database.create_job(f"job-{time.time_ns()}", owner, project_id, params))
+    asyncio.run(
+        database.update_job_status(
+            job["job_id"], "error", error=error, results=[],
+            owner_hash=owner, project_id=project_id,
+        )
+    )
+    return job["job_id"]
+
+
+_RETRY_IMAGE_PARAMS = {
+    "mode": "image", "model": "nano-banana-pro", "ratio": "16:9", "qty": 1,
+    "res": "1K", "length": None, "vmode": "text", "prompt": "mèo đeo kính",
+    "references": [],
+}
+
+
+def test_create_job_persists_params_for_retry(playground_client):
+    client, database = playground_client
+    _login(client)
+    project = _create_project(client)
+    owner = hashlib.sha256(b"test-key").hexdigest()
+    params = dict(_RETRY_IMAGE_PARAMS)
+    asyncio.run(database.create_job("job-params", owner, project["id"], params))
+    stored = asyncio.run(
+        database.get_job(owner, project["id"], "job-params", include_params=True)
+    )
+    assert stored["params"] == params
+    # List endpoint không lộ params — payload client giữ gọn.
+    jobs = asyncio.run(database.list_jobs_for_project(owner, project["id"]))
+    assert jobs and all("params" not in job for job in jobs)
+
+
+def test_retry_endpoint_reruns_failed_job(playground_client, monkeypatch):
+    client, database = playground_client
+    _login(client)
+    project = _create_project(client)
+    owner = hashlib.sha256(b"test-key").hexdigest()
+    job_id = _fail_job(database, owner, project["id"], dict(_RETRY_IMAGE_PARAMS))
+
+    captured = {}
+
+    def fake_spawn(coro):
+        frame = coro.cr_frame.f_locals
+        captured["job_id"] = frame.get("job_id")
+        captured["params"] = frame.get("params")
+        coro.close()
+
+    monkeypatch.setattr(generation, "spawn_job", fake_spawn)
+    response = client.post(
+        f"/playground/api/projects/{project['id']}/jobs/{job_id}/retry",
+        headers=_mutation_headers(),
+    )
+    assert response.status_code == 202
+    # Giữ nguyên job_id — thẻ lỗi trên UI biến lại spinner tại chỗ.
+    assert response.json()["job_id"] == job_id
+    assert captured["job_id"] == job_id
+    assert captured["params"]["prompt"] == _RETRY_IMAGE_PARAMS["prompt"]
+    status = asyncio.run(database.get_job(owner, project["id"], job_id))
+    assert status["status"] == "running"
+    assert status["error"] is None
+
+
+def test_retry_endpoint_guards(playground_client):
+    client, database = playground_client
+    _login(client)
+    project = _create_project(client)
+    owner = hashlib.sha256(b"test-key").hexdigest()
+    base = f"/playground/api/projects/{project['id']}/jobs"
+
+    asyncio.run(database.create_job("job-running", owner, project["id"]))
+    # Job running không retry được
+    assert client.post(f"{base}/job-running/retry", headers=_mutation_headers()).status_code == 409
+    # Job lỗi nhưng không có params (tạo trước khi có retry) → 409 kèm chỉ dẫn
+    asyncio.run(database.create_job("job-old", owner, project["id"]))
+    asyncio.run(
+        database.update_job_status(
+            "job-old", "error", error="x", results=[],
+            owner_hash=owner, project_id=project["id"],
+        )
+    )
+    assert client.post(f"{base}/job-old/retry", headers=_mutation_headers()).status_code == 409
+    # Job lạ → 404
+    assert client.post(f"{base}/job-none/retry", headers=_mutation_headers()).status_code == 404
+    # Thiếu mutation marker → chặn như mọi endpoint mutate khác
+    assert client.post(f"{base}/job-old/retry").status_code == 403
+
+
+def test_retry_re_resolves_deleted_reference(playground_client):
+    client, database = playground_client
+    _login(client)
+    project = _create_project(client)
+    owner = hashlib.sha256(b"test-key").hexdigest()
+    params = {
+        "mode": "video", "model": "veo-3.1-lite", "ratio": "16:9", "qty": 1,
+        "res": None, "length": 8, "vmode": "frames", "prompt": "p",
+        "references": ["img-gone"],
+    }
+    job_id = _fail_job(database, owner, project["id"], params)
+    # Ảnh tham chiếu đã bị xoá khỏi project → 400 rõ ràng thay vì job chết lần nữa
+    response = client.post(
+        f"/playground/api/projects/{project['id']}/jobs/{job_id}/retry",
+        headers=_mutation_headers(),
+    )
+    assert response.status_code == 400
+
+
+def test_delete_endpoint_removes_failed_job(playground_client):
+    client, database = playground_client
+    _login(client)
+    project = _create_project(client)
+    owner = hashlib.sha256(b"test-key").hexdigest()
+    base = f"/playground/api/projects/{project['id']}/jobs"
+    job_id = _fail_job(database, owner, project["id"])
+    # Job running không xoá được
+    asyncio.run(database.create_job("job-running", owner, project["id"]))
+    assert client.delete(f"{base}/job-running", headers=_mutation_headers()).status_code == 409
+    # Job lỗi xoá được và biến mất khỏi list
+    assert client.delete(f"{base}/{job_id}", headers=_mutation_headers()).status_code == 204
+    jobs = asyncio.run(database.list_jobs_for_project(owner, project["id"]))
+    assert all(job["job_id"] != job_id for job in jobs)
+    assert client.delete(f"{base}/{job_id}", headers=_mutation_headers()).status_code == 404

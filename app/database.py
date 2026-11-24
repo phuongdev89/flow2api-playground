@@ -90,6 +90,14 @@ class PlaygroundDatabase:
                     await db.execute(
                         "ALTER TABLE playground_sessions ADD COLUMN api_url TEXT"
                     )
+                # Job lưu params gốc (additive) để nút Retry chạy lại đúng combo —
+                # DB cũ thiếu cột thì thêm; job cũ không có params là không retry được.
+                cursor = await db.execute("PRAGMA table_info(playground_jobs)")
+                job_columns = {row[1] for row in await cursor.fetchall()}
+                if "params_json" not in job_columns:
+                    await db.execute(
+                        "ALTER TABLE playground_jobs ADD COLUMN params_json TEXT"
+                    )
                 # Job 'running' cũ (quá JOB_ORPHAN_STALE_MS) sau khi server khởi động
                 # lại là job mồ côi (background task đã mất) → đánh dấu lỗi để client
                 # không poll vô hạn. Job đang chạy gần đây thì giữ nguyên — có thể
@@ -280,8 +288,8 @@ class PlaygroundDatabase:
     JOB_ORPHAN_STALE_MS = 30 * 60 * 1000
 
     @staticmethod
-    def _job(row):
-        return {
+    def _job(row, include_params: bool = False):
+        job = {
             "job_id": row["id"],
             "status": row["status"],
             "error": row["error"],
@@ -291,9 +299,19 @@ class PlaygroundDatabase:
             # khôi phục queue sau F5 nên có updated_at là tiện cho sắp xếp UI.
             "updated_at": row["updated_at"],
         }
+        if include_params:
+            # Chỉ endpoint retry đọc params — payload list client giữ gọn.
+            job["params"] = json.loads(row["params_json"]) if row["params_json"] else None
+        return job
 
-    async def create_job(self, job_id: str, owner_hash: str, project_id: str) -> dict:
-        """Đăng ký job mới (status 'running'); dọn job cũ đã xong hơn 24 giờ."""
+    async def create_job(
+        self, job_id: str, owner_hash: str, project_id: str, params: dict | None = None
+    ) -> dict:
+        """Đăng ký job mới (status 'running'); dọn job cũ đã xong hơn 24 giờ.
+
+        ``params`` là bộ tham số đã resolve (reference_urls, extend_media_id…)
+        — job lỗi sẽ dùng lại cho nút Retry.
+        """
         await self._initialize()
         now = int(time.time() * 1000)
         async with self._connect() as db:
@@ -313,9 +331,17 @@ class PlaygroundDatabase:
             )
             await db.execute(
                 "INSERT INTO playground_jobs("
-                "id, owner_hash, project_id, status, error, results_json, created_at, updated_at"
-                ") VALUES (?, ?, ?, ?, NULL, '[]', ?, ?)",
-                (job_id, owner_hash, project_id, self.JOB_RUNNING, now, now),
+                "id, owner_hash, project_id, status, error, results_json, params_json, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, NULL, '[]', ?, ?, ?)",
+                (
+                    job_id,
+                    owner_hash,
+                    project_id,
+                    self.JOB_RUNNING,
+                    json.dumps(params) if params else None,
+                    now,
+                    now,
+                ),
             )
             await db.commit()
         job = await self.get_job(owner_hash, project_id, job_id)
@@ -333,7 +359,9 @@ class PlaygroundDatabase:
             row = await cursor.fetchone()
         return int(row[0])
 
-    async def get_job(self, owner_hash: str, project_id: str, job_id: str) -> dict | None:
+    async def get_job(
+        self, owner_hash: str, project_id: str, job_id: str, include_params: bool = False
+    ) -> dict | None:
         await self._initialize()
         async with self._connect() as db:
             cursor = await db.execute(
@@ -341,7 +369,18 @@ class PlaygroundDatabase:
                 (job_id, owner_hash, project_id),
             )
             row = await cursor.fetchone()
-        return self._job(row) if row else None
+        return self._job(row, include_params=include_params) if row else None
+
+    async def delete_job(self, owner_hash: str, project_id: str, job_id: str) -> bool:
+        """Xoá hẳn job (chỉ job đã kết thúc — caller kiểm tra status trước)."""
+        await self._initialize()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "DELETE FROM playground_jobs WHERE id = ? AND owner_hash = ? AND project_id = ?",
+                (job_id, owner_hash, project_id),
+            )
+            await db.commit()
+        return cursor.rowcount > 0
 
     async def list_jobs_for_project(
         self, owner_hash: str, project_id: str, limit: int = 20

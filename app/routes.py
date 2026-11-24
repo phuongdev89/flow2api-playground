@@ -393,6 +393,51 @@ async def playground_gen_options(owner_hash: str = Security(_require_playground_
     return _response(generation.playground_gen_options())
 
 
+def _resolve_generate_params(project: dict, params: dict) -> dict:
+    """Resolve tham chiếu/extend của params theo trạng thái HIỆN TẠI của project.
+
+    Dùng chung cho generate lần đầu và retry job lỗi: references (id item ảnh)
+    → reference_urls, extend_item_id → extend_media_id. Id lạ / item đã bị xoá
+    → HTTPException 400 để client kịp sửa thay vì job error lúc chạy.
+    """
+    items_by_id = {
+        str(item.get("id")): item
+        for item in (project.get("results") or [])
+        if isinstance(item, dict)
+    }
+    params = dict(params)
+    if params.get("references"):
+        reference_urls = []
+        for ref_id in params["references"]:
+            item = items_by_id.get(ref_id)
+            url = item.get("url") if isinstance(item, dict) else None
+            if item is None or item.get("kind") != "image" or not isinstance(url, str) or not url:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Ảnh tham chiếu không hợp lệ hoặc không còn tồn tại trong dự án.",
+                )
+            reference_urls.append(url)
+        params["reference_urls"] = reference_urls
+    if params.get("vmode") == "extend":
+        source = items_by_id.get(params.get("extend_item_id") or "")
+        media_id = (source or {}).get("meta", {}).get("media_generation_id") if source else None
+        if (
+            source is None
+            or source.get("kind") != "video"
+            or not isinstance(media_id, str)
+            or not media_id
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Video gốc không hợp lệ hoặc thiếu media id — chỉ video tạo trong "
+                "playground mới nối tiếp được.",
+            )
+        params["extend_media_id"] = media_id
+        # Video extend từ nguồn lite: đoạn mới vẫn có WM viền → crop giống lite.
+        params["crop_like_lite"] = "lite" in str((source.get("meta") or {}).get("model", ""))
+    return params
+
+
 @router.post(
     "/playground/api/projects/{project_id}/generate",
     status_code=202,
@@ -416,42 +461,7 @@ async def playground_generate(
             detail="Đang có quá nhiều job chạy cùng lúc — vui lòng đợi job hiện tại xong.",
         )
     params = generation.validate_generate_payload(payload.model_dump())
-    items_by_id = {
-        str(item.get("id")): item
-        for item in (project.get("results") or [])
-        if isinstance(item, dict)
-    }
-    if params["references"]:
-        # Resolve id tham chiếu → URL ảnh thật trong project; id lạ thì 400
-        # để client kịp sửa thay vì job error lúc chạy.
-        reference_urls = []
-        for ref_id in params["references"]:
-            item = items_by_id.get(ref_id)
-            url = item.get("url") if isinstance(item, dict) else None
-            if item is None or item.get("kind") != "image" or not isinstance(url, str) or not url:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Ảnh tham chiếu không hợp lệ hoặc không còn tồn tại trong dự án.",
-                )
-            reference_urls.append(url)
-        params["reference_urls"] = reference_urls
-    if params.get("vmode") == "extend":
-        source = items_by_id.get(params["extend_item_id"] or "")
-        media_id = (source or {}).get("meta", {}).get("media_generation_id") if source else None
-        if (
-            source is None
-            or source.get("kind") != "video"
-            or not isinstance(media_id, str)
-            or not media_id
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="Video gốc không hợp lệ hoặc thiếu media id — chỉ video tạo trong "
-                "playground mới nối tiếp được.",
-            )
-        params["extend_media_id"] = media_id
-        # Video extend từ nguồn lite: đoạn mới vẫn có WM viền → crop giống lite.
-        params["crop_like_lite"] = "lite" in str((source.get("meta") or {}).get("model", ""))
+    params = _resolve_generate_params(project, params)
 
     api_key, api_url = await playground_db.api_credentials_for_owner(owner_hash)
     if not api_key:
@@ -461,7 +471,7 @@ async def playground_generate(
             headers=_NO_STORE_HEADERS,
         )
 
-    job = await playground_db.create_job(str(uuid.uuid4()), owner_hash, project_id)
+    job = await playground_db.create_job(str(uuid.uuid4()), owner_hash, project_id, params)
     generation.spawn_job(
         generation.run_playground_generate_job(
             playground_db, owner_hash, project_id, job["job_id"], params, api_key, api_url
@@ -500,6 +510,102 @@ async def playground_project_jobs(
     """
     jobs = await playground_db.list_jobs_for_project(owner_hash, project_id)
     return _response({"jobs": jobs})
+
+
+@router.post(
+    "/playground/api/projects/{project_id}/jobs/{job_id}/retry",
+    status_code=202,
+    include_in_schema=False,
+)
+async def playground_retry_job(
+    project_id: str,
+    job_id: str,
+    request: Request,
+    owner_hash: str = Security(_require_playground_owner),
+):
+    """Chạy lại job LỖI với đúng bộ tham số lúc gửi (giữ nguyên job_id).
+
+    Tham số gốc lưu trên row job (params_json); references/extend được resolve
+    lại theo project hiện tại — item đã bị xoá thì 400 thay vì để job chết
+    lần nữa. Job về trạng thái 'running' tại chỗ nên thẻ lỗi trên UI biến
+    lại thành spinner mà không nhảy vị trí.
+    """
+    await _require_playground_mutation(request, request.headers.get("x-playground-request"))
+    job = await playground_db.get_job(owner_hash, project_id, job_id, include_params=True)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] != "error":
+        raise HTTPException(status_code=409, detail="Chỉ job thất bại mới thử lại được.")
+    stored = job.get("params")
+    if not isinstance(stored, dict) or not stored:
+        raise HTTPException(
+            status_code=409,
+            detail="Job này không lưu được tham số gốc (tạo trước khi có tính năng retry) — "
+            "hãy gửi lại từ composer.",
+        )
+    project = await playground_db.get_project(owner_hash, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    # Guard như generate: cap job chạy + key còn hạn; params đã validate lúc gửi
+    # nhưng vẫn chạy lại validate_generate_payload để schema cũ/khó hiểu bị chặn sớm.
+    if await playground_db.count_running_jobs(owner_hash) >= PLAYGROUND_MAX_RUNNING_JOBS:
+        raise HTTPException(
+            status_code=429,
+            detail="Đang có quá nhiều job chạy cùng lúc — vui lòng đợi job hiện tại xong.",
+        )
+    try:
+        params = generation.validate_generate_payload(stored)
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Tham số gốc không còn hợp lệ: {exc.detail}",
+        ) from exc
+    params = _resolve_generate_params(project, params)
+    api_key, api_url = await playground_db.api_credentials_for_owner(owner_hash)
+    if not api_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Phiên hết hạn key flow2api — vui lòng đăng nhập lại.",
+            headers=_NO_STORE_HEADERS,
+        )
+    await playground_db.update_job_status(
+        job_id,
+        "running",
+        error=None,
+        results=[],
+        owner_hash=owner_hash,
+        project_id=project_id,
+    )
+    generation.spawn_job(
+        generation.run_playground_generate_job(
+            playground_db, owner_hash, project_id, job_id, params, api_key, api_url
+        )
+    )
+    return _response({"job_id": job_id}, status_code=202)
+
+
+@router.delete(
+    "/playground/api/projects/{project_id}/jobs/{job_id}",
+    status_code=204,
+    include_in_schema=False,
+)
+async def playground_delete_job(
+    project_id: str,
+    job_id: str,
+    request: Request,
+    owner_hash: str = Security(_require_playground_owner),
+):
+    """Xoá job thất bại khỏi danh sách (thẻ lỗi biến mất khỏi UI và queue F5)."""
+    await _require_playground_mutation(request, request.headers.get("x-playground-request"))
+    job = await playground_db.get_job(owner_hash, project_id, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] == "running":
+        raise HTTPException(
+            status_code=409,
+            detail="Job đang chạy — không xoá được, đợi job xong hoặc lỗi đã.",
+        )
+    await playground_db.delete_job(owner_hash, project_id, job_id)
 
 
 # ── Playground items (results / ảnh tham chiếu) ──────────────────────────

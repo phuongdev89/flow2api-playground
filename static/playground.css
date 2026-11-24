@@ -491,6 +491,53 @@ h1 { min-width: 0; overflow-wrap: anywhere; font-weight: 640; }
 @keyframes result-shimmer { to { transform: translateX(100%); } }
 @keyframes result-spin { to { transform: rotate(1turn); } }
 
+/* ── Thẻ job THẤT BẠI: giữ tại chỗ với lý do lỗi + Retry/Delete ─────────── */
+.result-card.is-failed {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 6px;
+  padding: 12px;
+  border-color: #b3261e66;
+  cursor: default;
+}
+.result-card.is-failed:hover { border-color: #b3261e99; }
+.result-failed-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.result-failed-reason {
+  max-width: 100%;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  font-size: 11px;
+  line-height: 1.4;
+  color: #ff8a80;
+  overflow-wrap: anywhere;
+  text-align: center;
+}
+.result-failed-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 2px;
+}
+.result-failed-retry,
+.result-failed-delete {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #000000b8;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 120ms var(--ease-out), background 120ms var(--ease-out);
+}
+.result-failed-retry:hover { border-color: var(--accent); color: var(--accent-ink); background: var(--accent); }
+.result-failed-delete:hover { border-color: #ff8a80; color: #ff8a80; }
+
 /* ── Hover overlay trên card: chỉ tên item (hành động dồn vào menu ⋯) ────── */
 .result-overlay {
   position: absolute;

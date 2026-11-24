@@ -177,16 +177,23 @@ def _model_reference_supported(mode: str, base: str) -> bool:
 
 
 def _compose_video_frames_request(
-    base: str, length: int | None, res: str | None, ratio: str
+    base: str, length: int | None, res: str | None, ratio: str, images: int | None = None
 ) -> tuple[str, dict] | None:
     """Compose key i2v (Frames to Video — 1-2 ảnh làm frame đầu/cuối).
 
     Chỉ lite (veo_3_1_i2v_lite*) và quality (veo_3_1_i2v_s*) có i2v trong
     catalog; fast/fast-ultra không có → None. Key lite có suffix orientation,
     key quality không (resolver tự map từ generationConfig.aspectRatio).
+
+    Lite tách theo số ảnh: 1 ảnh → veo_3_1_i2v_lite* (upstream chỉ nhận
+    min=max=1); 2 ảnh → veo_3_1_interpolation_lite* (interpolation frame
+    đầu+cuối, min=max=2) — gửi 2 ảnh vào key i2v thường sẽ bị upstream từ
+    chối ("first/last-frame model requires 1-1 images; 2 provided").
+    Quality dùng chung key i2v_s* (nhận 1-2 ảnh). ``images`` None là probe
+    capability — chỉ tìm key, không lọc theo số ảnh.
     """
     if base.endswith("_lite"):
-        family = "veo_3_1_i2v_lite"
+        family = "veo_3_1_interpolation_lite" if images == 2 else "veo_3_1_i2v_lite"
         forms = [f"{family}_{_playground_orientation(ratio)}", family]
     elif base == "veo_3_1_t2v":
         family = "veo_3_1_i2v_s"
@@ -206,6 +213,11 @@ def _compose_video_frames_request(
         for key in candidates:
             entry = MODEL_CONFIG.get(key)
             if entry and entry.get("type") == "video" and entry.get("video_type") == "i2v":
+                if images is not None:
+                    min_images = entry.get("min_images", 1)
+                    max_images = entry.get("max_images", 2)
+                    if not min_images <= images <= max_images:
+                        continue
                 return key, {"aspectRatio": ratio}
     return None
 
@@ -412,7 +424,9 @@ def validate_generate_payload(payload: dict) -> dict:
             raise HTTPException(
                 status_code=400, detail="Model này không hỗ trợ Frames to Video (i2v)."
             )
-        if _compose_video_frames_request(spec["base"], length, res, ratio) is None:
+        if _compose_video_frames_request(
+            spec["base"], length, res, ratio, images=len(references)
+        ) is None:
             raise HTTPException(
                 status_code=400, detail="Model này không hỗ trợ tổ hợp Frames đã chọn."
             )
@@ -901,7 +915,8 @@ def _compose_chat_body(params: dict, reference_data_urls: list[str]) -> tuple[st
         request_model, gen_config = composed
     elif vmode == "frames":
         composed = _compose_video_frames_request(
-            params["base"], params["length"], params["res"], params["ratio"]
+            params["base"], params["length"], params["res"], params["ratio"],
+            images=len(reference_data_urls),
         )
         if composed is None:
             raise RuntimeError("Model không hỗ trợ tổ hợp Frames đã chọn.")

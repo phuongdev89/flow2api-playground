@@ -272,10 +272,11 @@ function renderProjects(focusProject, focusMore = false) {
 function projectRunningCount(projectId) {
   // Số job đang chạy của một project (gồm cả POST chưa trả job_id). Chỉ dùng để
   // chặn bulk delete đua với append_results server-side — send KHÔNG bị chặn.
+  // Job lỗi đã dừng hẳn (append không bao giờ xảy ra nữa) → không tính.
   if (!projectId) return 0;
   let count = 0;
   for (const job of jobsById.values()) {
-    if (job.projectId === projectId) count += 1;
+    if (job.projectId === projectId && job.status !== 'error') count += 1;
   }
   return count;
 }
@@ -744,6 +745,41 @@ function createPendingCard(pending) {
   return card;
 }
 
+function createFailedCard(job) {
+  // Thẻ thay mặt job THẤT BẠI: đứng nguyên chỗ spinner cũ, giữ lại cho tới khi
+  // user Retry (→ spinner) hoặc Delete (→ biến mất). Server giữ row lỗi 24h.
+  const card = document.createElement('div');
+  card.className = 'result-card is-failed';
+  card.setAttribute('role', 'status');
+  card.setAttribute('aria-label', 'Tạo nội dung thất bại');
+  card.style.aspectRatio = aspectFromRatio(job.ratio) ?? (job.mode === 'video' ? '16 / 9' : '1 / 1');
+  const label = document.createElement('span');
+  label.className = 'result-failed-label';
+  label.textContent = job.mode === 'video' ? 'Tạo video thất bại' : 'Tạo ảnh thất bại';
+  const reason = document.createElement('span');
+  reason.className = 'result-failed-reason';
+  const errorText = job.error || 'Không tạo được nội dung.';
+  reason.textContent = errorText;
+  reason.title = errorText;
+  const actions = document.createElement('div');
+  actions.className = 'result-failed-actions';
+  const retry = makeButton('result-failed-retry', '↻ Thử lại');
+  retry.title = 'Chạy lại với cùng tham số';
+  retry.addEventListener('click', (event) => {
+    event.stopPropagation();
+    retryFailedJob(job.jobId);
+  });
+  const remove = makeButton('result-failed-delete', 'Xóa');
+  remove.title = 'Xóa thông báo lỗi này';
+  remove.addEventListener('click', (event) => {
+    event.stopPropagation();
+    deleteFailedJob(job.jobId);
+  });
+  actions.append(retry, remove);
+  card.append(label, reason, actions);
+  return card;
+}
+
 function renderResultsGrid() {
   const active = projects.find(({ id }) => id === activeProject);
   if (workspace.hidden || !active) {
@@ -761,6 +797,10 @@ function renderResultsGrid() {
     .filter((job) => job.projectId === active.id)
     .sort((a, b) => b.startedAt - a.startedAt);
   for (const job of projectJobs) {
+    if (job.status === 'error') {
+      cards.push(createFailedCard(job));
+      continue;
+    }
     const partial = (Array.isArray(job.partial) ? job.partial : []).slice(0, job.count).reverse();
     for (const item of partial) {
       const card = createResultCard(item);
@@ -1375,9 +1415,11 @@ function startPolling(jobId) {
 function resumePollingIfNeeded(projectId) {
   // Job sống qua đổi project: khi project trở lại active mà chưa có poller nào
   // theo dõi thì dựng lại interval (sau F5 thì reconcileProjectJobs lo).
+  // Job lỗi không cần poller — nó chờ user bấm Retry/Delete.
   if (!projectId) return;
   for (const [jobId, job] of jobsById) {
     if (job.projectId !== projectId || jobId.startsWith('tmp:')) continue;
+    if (job.status === 'error') continue;
     if (!timersByJob.has(jobId)) startPolling(jobId);
   }
 }
@@ -1514,7 +1556,15 @@ function reconcileJobsFromList(projectId, serverJobs, { live = false } = {}) {
   for (const [jobId, job] of [...jobsById]) {
     if (job.projectId !== projectId || jobId.startsWith('tmp:')) continue;
     const server = serverById.get(jobId);
-    if (!server) continue; // chưa thấy trong danh sách — giữ nguyên chờ poll sau
+    if (!server) {
+      // Job lỗi biến mất khỏi list = server đã dọn (quá 24h hoặc vượt 20 job)
+      // — thẻ lỗi không còn hậu thuẫn, gỡ khỏi queue luôn.
+      if (job.status === 'error') {
+        removeJob(jobId);
+        gridDirty = true;
+      }
+      continue; // chưa thấy trong danh sách — giữ nguyên chờ poll sau
+    }
     if (server.status === 'done') {
       const outcome = finishJob(jobId, Array.isArray(server.results) ? server.results : []);
       if (outcome) {
@@ -1531,11 +1581,17 @@ function reconcileJobsFromList(projectId, serverJobs, { live = false } = {}) {
         gridDirty = true;
       }
     } else if (server.status === 'error') {
-      // Job lỗi lúc load là job lỗi lâu rồi — bỏ qua im lặng; đang live thì báo.
-      failJob(jobId, live ? (server.error || 'Không tạo được nội dung.') : null);
+      // Job lỗi giữ thẻ tại chỗ (Retry/Delete); đang live thì báo thêm toast.
+      failJob(jobId, server.error || 'Không tạo được nội dung.', { silent: !live });
       gridDirty = true;
     } else if (server.status === 'running') {
       // Still running: adopt partial results early when the backend streams them.
+      // (Job lỗi local mà server báo running = tab khác vừa retry — hồi spinner.)
+      if (job.status === 'error') {
+        job.status = 'running';
+        delete job.error;
+        gridDirty = true;
+      }
       const results = Array.isArray(server.results) ? server.results : [];
       const prev = Array.isArray(job.partial) ? job.partial : [];
       if (results.length !== prev.length) gridDirty = true;
@@ -1547,10 +1603,11 @@ function reconcileJobsFromList(projectId, serverJobs, { live = false } = {}) {
     }
   }
   if (!live) {
-    // Lượt reconcile lúc load/đổi project: track thêm job running chưa có trong
-    // jobsById — ưu tiên metadata từ queue localStorage (đúng mode/count/ratio
-    // lúc gửi), thiếu thì đoán từ results. Entry done/error còn trong queue là
-    // job xong lúc trang đóng: merge tĩnh (dedupe theo id) + dọn khỏi queue.
+    // Lượt reconcile lúc load/đổi project: track thêm job running + error chưa có
+    // trong jobsById — ưu tiên metadata từ queue localStorage (đúng mode/count/
+    // ratio lúc gửi), thiếu thì đoán từ results. Entry done còn trong queue là
+    // job xong lúc trang đóng: merge tĩnh (dedupe theo id) + dọn khỏi queue;
+    // entry error thì dựng thẻ lỗi (giữ trong queue tới khi user retry/delete).
     const queueEntries = new Map(loadJobQueue().map((entry) => [entry.jobId, entry]));
     // POST đang bay cho project này thì job của nó sẽ có entry thật khi POST
     // trả job_id — adopt bây giờ sẽ sinh pending card trùng, nên bỏ qua lượt này.
@@ -1572,12 +1629,28 @@ function reconcileJobsFromList(projectId, serverJobs, { live = false } = {}) {
         });
         startPolling(serverId);
         gridDirty = true;
+      } else if (server.status === 'error') {
+        // Job lỗi chưa có trong jobsById (tab khác gửi hoặc queue mất): dựng
+        // thẻ lỗi để user vẫn Retry/Delete được sau F5.
+        const queued = queueEntries.get(serverId);
+        const entry = queued ?? guessJobEntry(projectId, serverId, server, results);
+        jobsById.set(serverId, {
+          ...entry,
+          count: Math.max(1, Number(entry.count) || 1),
+          startedAt: Number(entry.startedAt) || Date.now(),
+          status: 'error',
+          error: server.error || 'Không tạo được nội dung.',
+          partial: [],
+        });
+        gridDirty = true;
       } else if (queueEntries.has(serverId)) {
+        // Job done còn trong queue: merge tĩnh kết quả rồi dọn entry.
         const merged = mergeJobResults(projectId, results);
         if (merged) noteLoadMerge(merged);
       }
     }
-    // Mirror hiện trạng: entry stale (done/error/project đã xóa) rơi khỏi queue.
+    // Mirror hiện trạng: entry stale (done/project đã xóa) rơi khỏi queue;
+    // job lỗi giữ nguyên trong queue cho tới khi user retry/delete.
     persistJobQueue();
   }
   if (gridDirty && projectId === activeProject) renderResultsGrid();
@@ -1631,12 +1704,87 @@ function finishJob(jobId, results) {
   return { created, merged, mode: job.mode, count: job.count };
 }
 
-function failJob(jobId, message) {
+function failJob(jobId, message, { silent = false } = {}) {
+  // Job lỗi KHÔNG bị gỡ khỏi queue nữa — giữ thẻ tại chỗ kèm nút Retry/Delete.
+  // Server giữ row lỗi 24h nên sau F5 reconcile vẫn dựng lại thẻ từ GET /jobs.
   const job = jobsById.get(jobId);
   if (!job) return;
-  removeJob(jobId);
+  stopPolling(jobId);
+  job.status = 'error';
+  job.partial = [];
+  if (message) job.error = String(message);
+  if (message && !silent) showToast(String(message));
   if (job.projectId === activeProject) renderResultsGrid();
-  if (message) showToast(message);
+}
+
+async function retryFailedJob(jobId) {
+  const job = jobsById.get(jobId);
+  if (!job || job.status !== 'error') return;
+  let response;
+  try {
+    response = await request(
+      projectPath(job.projectId, `/jobs/${encodeURIComponent(jobId)}/retry`),
+      { method: 'POST' },
+    );
+  } catch {
+    showToast('Không kết nối được với máy chủ.');
+    return;
+  }
+  if (response.status === 401 || response.status === 403) {
+    setSignedIn(false);
+    keyInput.focus();
+    return;
+  }
+  if (!response.ok) {
+    // 409 (tham số gốc không còn hợp lệ / job không còn trạng thái lỗi), 429…
+    let message = 'Không thử lại được job này.';
+    try {
+      const data = await response.json();
+      if (data?.detail) message = String(data.detail);
+    } catch { /* Keep the generic message. */ }
+    showToast(message);
+    return;
+  }
+  // Server đã reset job về running (giữ job_id) — thẻ lỗi biến lại spinner.
+  job.status = 'running';
+  delete job.error;
+  job.partial = [];
+  job.startedAt = Date.now(); // reset đồng hồ JOB_MAX_WAIT_MS + đưa lên đầu queue
+  startPolling(jobId);
+  persistJobQueue();
+  if (job.projectId === activeProject) renderResultsGrid();
+}
+
+async function deleteFailedJob(jobId) {
+  const job = jobsById.get(jobId);
+  if (!job) return;
+  let response;
+  try {
+    response = await request(
+      projectPath(job.projectId, `/jobs/${encodeURIComponent(jobId)}`),
+      { method: 'DELETE' },
+    );
+  } catch {
+    showToast('Không kết nối được với máy chủ.');
+    return;
+  }
+  if (response.status === 401 || response.status === 403) {
+    setSignedIn(false);
+    keyInput.focus();
+    return;
+  }
+  if (!response.ok) {
+    let message = 'Không xóa được job này.';
+    try {
+      const data = await response.json();
+      if (data?.detail) message = String(data.detail);
+    } catch { /* Keep the generic message. */ }
+    showToast(message);
+    return;
+  }
+  removeJob(jobId);
+  persistJobQueue();
+  if (job.projectId === activeProject) renderResultsGrid();
 }
 
 function showError(message = '', invalidField = null) {
