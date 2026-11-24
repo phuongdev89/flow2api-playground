@@ -45,7 +45,23 @@ const genLengthSlider = document.querySelector('#gen-length-slider');
 const genLengthTicks = document.querySelector('#gen-length-ticks');
 const genModelList = document.querySelector('#gen-model-list');
 const genResImageRow = document.querySelector('#gen-res-image');
+const composer = document.querySelector('.composer');
 const composerRefs = document.querySelector('#composer-refs');
+const composerFrames = document.querySelector('#composer-frames');
+const framesExit = document.querySelector('#frames-exit');
+const framesSwap = document.querySelector('#frames-swap');
+const frameSlotEls = {
+  start: document.querySelector('#frame-slot-start'),
+  end: document.querySelector('#frame-slot-end'),
+};
+const framePicker = document.querySelector('#frame-picker');
+const framePickerTitle = document.querySelector('#frame-picker-title');
+const framePickerGrid = document.querySelector('#frame-picker-grid');
+const framePickerEmpty = document.querySelector('#frame-picker-empty');
+const framePickerClose = document.querySelector('#frame-picker-close');
+const frameUploadInput = document.querySelector('#frame-upload-input');
+const refUploadInput = document.querySelector('#ref-upload-input');
+const stageDropOverlay = document.querySelector('#stage-drop-overlay');
 const resultsGrid = document.querySelector('#results-grid');
 const resultsEmpty = document.querySelector('#results-empty');
 const selectionToolbar = document.querySelector('#selection-toolbar');
@@ -75,7 +91,10 @@ const JOB_QUEUE_KEY = 'playground_job_queue';
 // 'reference' trên server được sync ngầm để giữ selection qua reload.
 const MAX_REFS = { image: 10, video: 3 };
 const selectionByProject = new Map(); // project id -> [item id theo thứ tự chọn]
+const frameSlotsByProject = new Map(); // project id -> { startId, endId } cho chế độ Frames
 const roleSyncTimers = new Map(); // project id -> debounce handle
+let vmodeManual = false;
+let framePickerSlot = null; // 'start' | 'end' | null
 
 const GEN_OPTIONS = {
   image: {
@@ -298,6 +317,8 @@ function showProjectContents() {
     activeProject,
     projectReferenceItems(active).map((item) => String(item.id)),
   );
+  syncFrameSlotsFromSelection(activeProject);
+  closeFramePicker();
   renderResultsGrid();
   renderComposerRefs();
   syncSelectionToolbar();
@@ -326,31 +347,90 @@ function selectedImageItems() {
   return selectedItems().filter((item) => item.kind === 'image');
 }
 
-function selectionChanged() {
+function isFramesMode() {
+  return genState.mode === 'video' && genState.video.vmode === 'frames';
+}
+
+function projectImageById(projectId = activeProject) {
+  const project = projects.find(({ id }) => id === projectId);
+  const byId = new Map();
+  for (const item of project?.results ?? []) {
+    if (item && item.kind === 'image' && item.id !== undefined && item.id !== null) {
+      byId.set(String(item.id), item);
+    }
+  }
+  return byId;
+}
+
+function getFrameSlots(projectId = activeProject) {
+  if (!projectId) return { startId: null, endId: null };
+  const byId = projectImageById(projectId);
+  const stored = frameSlotsByProject.get(projectId);
+  if (!stored) {
+    const imgs = (selectionByProject.get(projectId) ?? []).filter((id) => byId.has(id));
+    return { startId: imgs[0] ?? null, endId: imgs[1] ?? null };
+  }
+  const startId = stored.startId && byId.has(stored.startId) ? stored.startId : null;
+  const endId = stored.endId && byId.has(stored.endId) ? stored.endId : null;
+  return { startId, endId };
+}
+
+function syncFrameSlotsFromSelection(projectId = activeProject) {
+  if (!projectId) return;
+  const byId = projectImageById(projectId);
+  const imgs = (selectionByProject.get(projectId) ?? []).filter((id) => byId.has(id));
+  const prev = frameSlotsByProject.get(projectId);
+  if (imgs.length === 0) {
+    frameSlotsByProject.set(projectId, { startId: null, endId: null });
+    return;
+  }
+  if (imgs.length === 1) {
+    if (prev && prev.startId === null && prev.endId === imgs[0]) {
+      frameSlotsByProject.set(projectId, { startId: null, endId: imgs[0] });
+    } else {
+      frameSlotsByProject.set(projectId, { startId: imgs[0], endId: null });
+    }
+    return;
+  }
+  // Giữ thứ tự Start/End nếu 2 ảnh trùng khớp với slot hiện có (tránh nhảy ngược khi đồng bộ).
+  if (prev && prev.startId && prev.endId && imgs.includes(prev.startId) && imgs.includes(prev.endId)) {
+    frameSlotsByProject.set(projectId, { startId: prev.startId, endId: prev.endId });
+    return;
+  }
+  frameSlotsByProject.set(projectId, { startId: imgs[0], endId: imgs[1] });
+}
+
+function selectionChanged({ preserveSlots = false } = {}) {
+  if (!preserveSlots) syncFrameSlotsFromSelection();
   applyVideoVmodeAuto();
   renderResultsGrid();
   renderComposerRefs();
+  renderGenDialog();
   syncSelectionRoles();
   syncSelectionToolbar();
 }
 
 // Auto-chọn vmode theo số ảnh đang chọn (giữ combo luôn hợp lệ):
-// 0 ảnh → Text; 1-2 ảnh → Frames (nếu model hỗ trợ); ≥3 → Ingredients.
+// 0 ảnh → Text (nếu không phải user chủ động mở Frames); 1-2 ảnh → Frames; ≥3 → Ingredients.
 function applyVideoVmodeAuto() {
   if (genState.mode !== 'video') return;
   if (genState.video.vmode === 'extend') return; // chế độ nối tiếp: không tự đổi
   const model = genSelectedModel('video');
   const count = selectedImageItems().length;
   if (count === 0) {
-    genState.video.vmode = 'text';
+    if (!(genState.video.vmode === 'frames' && vmodeManual)) {
+      genState.video.vmode = 'text';
+    }
     return;
   }
   if (genState.video.vmode === 'text' && count > 0) {
+    vmodeManual = false;
     genState.video.vmode = count <= 2 && model?.frames === true ? 'frames'
       : model?.refs === true ? 'ingredients' : 'text';
     return;
   }
   if (genState.video.vmode === 'frames' && count > 2) {
+    vmodeManual = false;
     genState.video.vmode = model?.refs === true ? 'ingredients' : 'frames';
   }
 }
@@ -476,7 +556,13 @@ function composerRefCap() {
 }
 
 function renderComposerRefs() {
+  renderComposerFrames();
   if (!composerRefs) return;
+  if (isFramesMode()) {
+    composerRefs.hidden = true;
+    composerRefs.replaceChildren();
+    return;
+  }
   const items = selectedItems();
   if (!items.length || workspace.hidden) {
     composerRefs.hidden = true;
@@ -508,18 +594,10 @@ function renderComposerRefs() {
     cross.textContent = '×';
     cross.setAttribute('aria-label', 'Bỏ chọn');
     cross.setAttribute('tabindex', unusable || overflow ? '-1' : '0');
-    if (!unusable && !overflow) {
-      cross.addEventListener('click', (event) => {
-        event.stopPropagation();
-        setSelected(item.id, false);
-      });
-    } else {
-      // Chip vô dụng/vượt hạn: bấm để loại khỏi selection cho gọn.
-      cross.addEventListener('click', (event) => {
-        event.stopPropagation();
-        setSelected(item.id, false);
-      });
-    }
+    cross.addEventListener('click', (event) => {
+      event.stopPropagation();
+      setSelected(item.id, false);
+    });
     chip.append(img, cross);
     return chip;
   });
@@ -538,6 +616,440 @@ function renderComposerRefs() {
   composerRefs.replaceChildren(counter, ...chips);
   composerRefs.hidden = false;
 }
+
+function setFrameSlot(slot, itemId) {
+  if (!activeProject) return;
+  const current = getFrameSlots(activeProject);
+  const next = { ...current };
+  const val = itemId ? String(itemId) : null;
+  if (slot === 'start') next.startId = val;
+  else next.endId = val;
+  vmodeManual = true;
+  frameSlotsByProject.set(activeProject, next);
+  const uniqueIds = [...new Set([next.startId, next.endId].filter(Boolean))];
+  selectionByProject.set(activeProject, uniqueIds);
+  selectionChanged({ preserveSlots: true });
+}
+
+function swapFrameSlots() {
+  if (!activeProject) return;
+  const current = getFrameSlots(activeProject);
+  if (!current.startId && !current.endId) return;
+  const next = { startId: current.endId, endId: current.startId };
+  vmodeManual = true;
+  frameSlotsByProject.set(activeProject, next);
+  const uniqueIds = [...new Set([next.startId, next.endId].filter(Boolean))];
+  selectionByProject.set(activeProject, uniqueIds);
+  selectionChanged({ preserveSlots: true });
+}
+
+function renderFrameSlot(slotName, item) {
+  const el = frameSlotEls[slotName];
+  if (!el) return;
+  const trigger = el.querySelector('.frame-slot-trigger');
+  const plus = el.querySelector('.frame-slot-plus');
+  const img = el.querySelector('.frame-slot-thumb img');
+  const sub = el.querySelector('.frame-slot-sub');
+  const clearBtn = el.querySelector('.frame-slot-clear');
+  const filled = Boolean(item);
+  el.classList.toggle('is-filled', filled);
+  el.classList.toggle('is-open', framePickerSlot === slotName && !framePicker.hidden);
+  trigger.setAttribute('aria-expanded', String(framePickerSlot === slotName && !framePicker.hidden));
+  if (filled) {
+    img.src = item.url;
+    img.hidden = false;
+    plus.hidden = true;
+    sub.textContent = itemDisplayName(item, false);
+    clearBtn.hidden = false;
+  } else {
+    img.removeAttribute('src');
+    img.hidden = true;
+    plus.hidden = false;
+    sub.textContent = 'Chọn hoặc tải ảnh';
+    clearBtn.hidden = true;
+  }
+}
+
+function renderFramePickerGrid() {
+  if (!framePicker || framePicker.hidden) return;
+  const active = activeProjectData();
+  const images = (Array.isArray(active?.results) ? active.results : [])
+    .filter((item) => item && item.kind === 'image' && typeof item.url === 'string' && item.url)
+    .reverse();
+  const slots = getFrameSlots(activeProject);
+  framePickerTitle.textContent = framePickerSlot === 'end' ? 'Chọn End frame' : 'Chọn Start frame';
+  if (!images.length) {
+    framePickerGrid.replaceChildren();
+    framePickerGrid.hidden = true;
+    framePickerEmpty.hidden = false;
+    return;
+  }
+  framePickerEmpty.hidden = true;
+  framePickerGrid.hidden = false;
+  framePickerGrid.replaceChildren(
+    ...images.map((item) => {
+      const id = String(item.id);
+      const isStart = slots.startId === id;
+      const isEnd = slots.endId === id;
+      const btn = makeButton('frame-picker-item', '');
+      btn.title = itemDisplayName(item, false);
+      if ((framePickerSlot === 'start' && isStart) || (framePickerSlot === 'end' && isEnd)) {
+        btn.classList.add('is-chosen');
+      }
+      const img = document.createElement('img');
+      img.src = item.url;
+      img.alt = itemDisplayName(item, false);
+      btn.append(img);
+      if (isStart || isEnd) {
+        const tag = document.createElement('span');
+        tag.className = 'frame-picker-tag';
+        tag.textContent = isStart && isEnd ? 'S+E' : isStart ? 'Start' : 'End';
+        btn.append(tag);
+      }
+      btn.addEventListener('click', () => {
+        const slot = framePickerSlot || 'start';
+        closeFramePicker();
+        setFrameSlot(slot, id);
+      });
+      return btn;
+    }),
+  );
+}
+
+function openFramePicker(slot) {
+  if (!composerFrames || composerFrames.hidden) return;
+  if (framePickerSlot === slot && !framePicker.hidden) {
+    closeFramePicker();
+    return;
+  }
+  setGenDialogOpen(false);
+  framePickerSlot = slot;
+  framePicker.hidden = false;
+  renderComposerFrames();
+  renderFramePickerGrid();
+}
+
+function closeFramePicker() {
+  if (!framePicker || framePicker.hidden) {
+    framePickerSlot = null;
+    return;
+  }
+  framePicker.hidden = true;
+  framePickerSlot = null;
+  renderComposerFrames();
+}
+
+function renderComposerFrames() {
+  const active = isFramesMode() && !workspace.hidden;
+  if (composer) composer.classList.toggle('is-frames', active);
+  prompt.placeholder = active
+    ? 'Mô tả chuyển động giữa Start frame và End frame…'
+    : 'What do you want to create?';
+  if (!composerFrames) return;
+  if (!active) {
+    composerFrames.hidden = true;
+    if (framePicker) framePicker.hidden = true;
+    framePickerSlot = null;
+    return;
+  }
+  const byId = projectImageById(activeProject);
+  const slots = getFrameSlots(activeProject);
+  renderFrameSlot('start', slots.startId ? byId.get(slots.startId) ?? null : null);
+  renderFrameSlot('end', slots.endId ? byId.get(slots.endId) ?? null : null);
+  if (framesSwap) framesSwap.disabled = !(slots.startId || slots.endId);
+  composerFrames.hidden = false;
+  if (framePicker && !framePicker.hidden) renderFramePickerGrid();
+}
+
+for (const slot of ['start', 'end']) {
+  const el = frameSlotEls[slot];
+  if (!el) continue;
+  el.querySelector('.frame-slot-trigger')?.addEventListener('click', (event) => {
+    event.stopPropagation();
+    openFramePicker(slot);
+  });
+  el.querySelector('.frame-slot-clear')?.addEventListener('click', (event) => {
+    event.stopPropagation();
+    setFrameSlot(slot, null);
+  });
+}
+
+framesSwap?.addEventListener('click', () => swapFrameSlots());
+framesExit?.addEventListener('click', () => {
+  vmodeManual = false;
+  closeFramePicker();
+  genState.video.vmode = 'text';
+  renderGenDialog();
+  renderComposerRefs();
+});
+framePickerClose?.addEventListener('click', () => closeFramePicker());
+
+const MAX_REF_UPLOAD_BYTES = 12 * 1024 * 1024;
+let dragEnterDepth = 0;
+
+function clearDropHighlights() {
+  dragEnterDepth = 0;
+  if (stageDropOverlay) stageDropOverlay.hidden = true;
+  composer?.classList.remove('is-drag-over');
+  frameSlotEls.start?.classList.remove('is-drag-over');
+  frameSlotEls.end?.classList.remove('is-drag-over');
+  framePicker?.classList.remove('is-drag-over');
+}
+
+function updateDropHighlights(target) {
+  if (stageDropOverlay) stageDropOverlay.hidden = false;
+  const el = target instanceof Element ? target : null;
+  const onStart = Boolean(el?.closest('#frame-slot-start'));
+  const onEnd = Boolean(el?.closest('#frame-slot-end'));
+  const onPicker = Boolean(el?.closest('#frame-picker'));
+  const onComposer = Boolean(el?.closest('.composer')) && !onStart && !onEnd && !onPicker;
+  composer?.classList.toggle('is-drag-over', onComposer);
+  frameSlotEls.start?.classList.toggle('is-drag-over', onStart);
+  frameSlotEls.end?.classList.toggle('is-drag-over', onEnd);
+  framePicker?.classList.toggle('is-drag-over', onPicker);
+}
+
+function isFileDragEvent(event) {
+  const types = event?.dataTransfer?.types;
+  return Boolean(types && Array.from(types).includes('Files'));
+}
+
+function isModalOpen() {
+  return [
+    document.querySelector('#lightbox'),
+    document.querySelector('#video-editor'),
+    document.querySelector('#mask-editor'),
+    document.querySelector('#wm-modal'),
+    document.querySelector('#item-dialog'),
+  ].some((el) => el && !el.hidden);
+}
+
+function guessImageMime(file) {
+  if (!file) return null;
+  const type = String(file.type || '').toLowerCase();
+  if (/^image\/(png|jpeg|jpg|webp)$/i.test(type)) return type === 'image/jpg' ? 'image/jpeg' : type;
+  if (type.startsWith('image/')) return type;
+  const name = String(file.name || '').toLowerCase();
+  if (name.endsWith('.png')) return 'image/png';
+  if (name.endsWith('.jpg') || name.endsWith('.jpeg')) return 'image/jpeg';
+  if (name.endsWith('.webp')) return 'image/webp';
+  if (/\.(gif|bmp|avif|svg|ico|tif|tiff)$/i.test(name)) return 'image/png';
+  return null;
+}
+
+function normalizeDataUrlPrefix(dataUrl, mime) {
+  if (!dataUrl || !mime) return dataUrl;
+  return dataUrl.replace(/^data:(?:application\/octet-stream|);base64,/i, `data:${mime};base64,`);
+}
+
+async function encodeImageViaCanvas(file) {
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error('decode failed'));
+      el.src = objectUrl;
+    });
+    const width = img.naturalWidth || img.width;
+    const height = img.naturalHeight || img.height;
+    if (!width || !height) return '';
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return '';
+    ctx.drawImage(img, 0, 0, width, height);
+    let dataUrl = canvas.toDataURL('image/png');
+    if (dataUrl.length <= 15_500_000) return dataUrl;
+    dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+    if (dataUrl.length <= 15_500_000) return dataUrl;
+    return canvas.toDataURL('image/jpeg', 0.8);
+  } catch {
+    return '';
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+async function readImageFileAsDataUrl(file) {
+  const mime = guessImageMime(file);
+  if (!mime) return { ok: false, reason: 'type' };
+  const isNative = /^image\/(png|jpeg|webp)$/i.test(mime);
+  if (isNative && file.size > 0 && file.size <= MAX_REF_UPLOAD_BYTES) {
+    const raw = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(new Error('read failed'));
+      reader.readAsDataURL(file);
+    }).catch(() => '');
+    const fixed = normalizeDataUrlPrefix(raw, mime);
+    if (/^data:image\/(png|jpeg|webp);base64,/i.test(fixed)) {
+      return { ok: true, dataUrl: fixed };
+    }
+  }
+  const converted = await encodeImageViaCanvas(file);
+  if (!converted) {
+    return { ok: false, reason: file.size > MAX_REF_UPLOAD_BYTES ? 'size' : 'decode' };
+  }
+  return { ok: true, dataUrl: converted };
+}
+
+async function uploadReferenceFiles(rawFiles, { target = 'refs', slot = null } = {}) {
+  if (workspace.hidden) return;
+  const files = [...(rawFiles || [])].filter(Boolean);
+  if (!files.length) return;
+
+  const prepared = [];
+  let badTypeCount = 0;
+  let badReadCount = 0;
+  for (const file of files) {
+    const res = await readImageFileAsDataUrl(file);
+    if (res.ok) {
+      const cleanName = String(file.name || '').replace(/\.[^.]+$/, '').trim().slice(0, 120) || 'Tham chiếu';
+      prepared.push({ name: cleanName, image: res.dataUrl });
+    } else if (res.reason === 'type') {
+      badTypeCount += 1;
+    } else {
+      badReadCount += 1;
+    }
+  }
+
+  if (!prepared.length) {
+    if (badTypeCount) {
+      showToast('Chỉ hỗ trợ tệp ảnh (PNG, JPEG, WebP…) để tải lên Playground làm tham chiếu.');
+    } else if (badReadCount) {
+      showToast('Ảnh quá lớn (tối đa 12MB) hoặc không đọc được.');
+    }
+    return;
+  }
+
+  const project = await ensureActiveProject();
+  if (!project) return;
+
+  const uploadedIds = [];
+  for (const entry of prepared) {
+    const latest = projects.find(({ id }) => id === project.id) ?? project;
+    const beforeIds = new Set((latest.results ?? []).map((item) => String(item?.id)));
+    const updated = await createReferenceItem(project.id, entry, { silent: true });
+    if (!updated) break;
+    const added = (updated.results ?? []).find((item) => !beforeIds.has(String(item?.id)))
+      ?? (updated.results ?? [])[(updated.results ?? []).length - 1];
+    if (added?.id) uploadedIds.push(String(added.id));
+  }
+
+  if (!uploadedIds.length) return;
+
+  if (target === 'frame-slot') {
+    const targetSlot = slot || 'start';
+    closeFramePicker();
+    setFrameSlot(targetSlot, uploadedIds[0]);
+    showToast(
+      `Đã tải ảnh lên Playground và đặt làm ${targetSlot === 'end' ? 'End' : 'Start'} frame.`,
+    );
+    return;
+  }
+
+  if (target === 'composer-frames' && isFramesMode()) {
+    closeFramePicker();
+    const slots = getFrameSlots(project.id);
+    if (uploadedIds.length === 1) {
+      const nextSlot = !slots.startId ? 'start' : (!slots.endId ? 'end' : 'start');
+      setFrameSlot(nextSlot, uploadedIds[0]);
+    } else {
+      const next = { startId: uploadedIds[0], endId: uploadedIds[1] };
+      vmodeManual = true;
+      frameSlotsByProject.set(project.id, next);
+      selectionByProject.set(project.id, [next.startId, next.endId]);
+      selectionChanged({ preserveSlots: true });
+    }
+    showToast(`Đã tải ${uploadedIds.length} ảnh lên Playground cho Frames (không tải lên Flow).`);
+    return;
+  }
+
+  // Giữ selection cũ + chọn thêm ảnh vừa thả để dùng làm tham chiếu ngay (không gửi lên Flow lúc tải).
+  const current = selectionIds(project.id);
+  const nextSelection = [...current];
+  for (const id of uploadedIds) {
+    if (!nextSelection.includes(id)) nextSelection.push(id);
+  }
+  selectionByProject.set(project.id, nextSelection);
+  selectionChanged();
+
+  const warnSuffix = badTypeCount || badReadCount ? ' (một số tệp không phải ảnh đã được bỏ qua)' : '';
+  showToast(
+    uploadedIds.length === 1
+      ? `Đã tải ảnh lên Playground làm tham chiếu (chưa tải lên Flow)${warnSuffix}.`
+      : `Đã tải ${uploadedIds.length} ảnh lên Playground làm tham chiếu (chưa tải lên Flow)${warnSuffix}.`,
+  );
+}
+
+frameUploadInput?.addEventListener('change', async (event) => {
+  const files = [...(event.target.files || [])];
+  event.target.value = '';
+  await uploadReferenceFiles(files, { target: 'frame-slot', slot: framePickerSlot || 'start' });
+});
+
+refUploadInput?.addEventListener('change', async (event) => {
+  const files = [...(event.target.files || [])];
+  event.target.value = '';
+  await uploadReferenceFiles(files, { target: isFramesMode() ? 'composer-frames' : 'refs' });
+});
+
+document.addEventListener('dragenter', (event) => {
+  if (workspace.hidden || isModalOpen() || !isFileDragEvent(event)) return;
+  event.preventDefault();
+  dragEnterDepth += 1;
+  updateDropHighlights(event.target);
+});
+
+document.addEventListener('dragover', (event) => {
+  if (workspace.hidden || isModalOpen() || !isFileDragEvent(event)) return;
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+  updateDropHighlights(event.target);
+});
+
+document.addEventListener('dragleave', (event) => {
+  if (!isFileDragEvent(event)) return;
+  dragEnterDepth = Math.max(0, dragEnterDepth - 1);
+  if (dragEnterDepth === 0 || !event.relatedTarget) clearDropHighlights();
+});
+
+document.addEventListener('drop', async (event) => {
+  const hadFiles = isFileDragEvent(event) || Boolean(event.dataTransfer?.files?.length);
+  clearDropHighlights();
+  if (workspace.hidden || !hadFiles) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (isModalOpen()) return;
+  const files = event.dataTransfer?.files;
+  if (!files || !files.length) return;
+  const el = event.target instanceof Element ? event.target : null;
+  if (el?.closest('#frame-slot-start')) {
+    await uploadReferenceFiles(files, { target: 'frame-slot', slot: 'start' });
+  } else if (el?.closest('#frame-slot-end')) {
+    await uploadReferenceFiles(files, { target: 'frame-slot', slot: 'end' });
+  } else if (el?.closest('#frame-picker')) {
+    await uploadReferenceFiles(files, { target: 'frame-slot', slot: framePickerSlot || 'start' });
+  } else if (el?.closest('.composer') && isFramesMode()) {
+    await uploadReferenceFiles(files, { target: 'composer-frames' });
+  } else {
+    await uploadReferenceFiles(files, { target: 'refs' });
+  }
+});
+
+document.addEventListener('dragend', clearDropHighlights);
+window.addEventListener('blur', clearDropHighlights);
+
+document.addEventListener('paste', async (event) => {
+  if (workspace.hidden || isModalOpen()) return;
+  const files = [...(event.clipboardData?.files || [])].filter((f) => guessImageMime(f));
+  if (!files.length) return;
+  const plainText = event.clipboardData?.getData?.('text/plain') || '';
+  if (!plainText) event.preventDefault();
+  await uploadReferenceFiles(files, { target: isFramesMode() ? 'composer-frames' : 'refs' });
+});
 
 async function loadProjects() {
   const response = await request('/playground/api/projects');
@@ -617,6 +1129,14 @@ function createResultCard(item) {
   }
   media.src = item.url;
   media.style.aspectRatio = aspectFromRatio(item?.meta?.ratio) ?? (isVideo ? '16 / 9' : '1 / 1');
+  if (!isVideo && !item?.meta?.ratio && item?.meta?.source === 'playground-reference') {
+    media.addEventListener('load', () => {
+      if (media.naturalWidth > 0 && media.naturalHeight > 0) {
+        const clamped = Math.min(Math.max(media.naturalWidth / media.naturalHeight, 0.45), 2.2);
+        media.style.aspectRatio = String(clamped);
+      }
+    });
+  }
   card.append(media);
   if (item.role === 'reference') {
     const badge = document.createElement('span');
@@ -710,9 +1230,13 @@ function reuseItemPrompt(item) {
   }
   // Theo luôn model dùng lúc generate nếu catalog vẫn còn model đó.
   const modelId = typeof item.meta?.model === 'string' ? item.meta.model : '';
-  if (modelId && optionsFor(mode).models.some((model) => model.id === modelId)) {
-    genState[mode].model = modelId;
-  }
+  const matchedModel = modelId
+    ? optionsFor(mode).models.find(
+        (model) => model.id === modelId || (modelId === 'nano-banana-pro' && model.base === 'gemini-3.0-pro-image'),
+      )
+    : null;
+  if (matchedModel) genState[mode].model = matchedModel.id;
+  if (mode === 'video' && genState.video.vmode === 'frames') vmodeManual = true;
   applyModelCapability(mode);
   prompt.value = promptText;
   // Bắn input để autosave draft + auto-grow textarea chạy đúng đường hiện có.
@@ -728,8 +1252,21 @@ function reuseItemPrompt(item) {
     const id = String(reference);
     if (liveImageIds.has(id)) setSelected(id, true);
   }
+  if (mode === 'video' && genState.video.vmode === 'frames' && activeProject) {
+    const validRefs = references.map((r) => String(r)).filter((id) => liveImageIds.has(id));
+    frameSlotsByProject.set(activeProject, { startId: validRefs[0] ?? null, endId: validRefs[1] ?? null });
+    renderComposerRefs();
+  }
   renderGenDialog();
   showToast('Đã điền lại prompt từ item này.');
+}
+
+function createCardAspectFrame(ratio, mode) {
+  const frame = document.createElement('div');
+  frame.className = 'result-card-frame';
+  frame.setAttribute('aria-hidden', 'true');
+  frame.style.aspectRatio = aspectFromRatio(ratio) ?? (mode === 'video' ? '16 / 9' : '1 / 1');
+  return frame;
 }
 
 function createPendingCard(pending) {
@@ -738,45 +1275,64 @@ function createPendingCard(pending) {
   card.setAttribute('role', 'status');
   card.setAttribute('aria-busy', 'true');
   card.setAttribute('aria-label', pending.mode === 'video' ? 'Đang tạo video…' : 'Đang tạo ảnh…');
-  card.style.aspectRatio = aspectFromRatio(pending.ratio) ?? (pending.mode === 'video' ? '16 / 9' : '1 / 1');
   const spinner = document.createElement('span');
   spinner.className = 'result-spinner';
-  card.append(spinner);
+  card.append(createCardAspectFrame(pending.ratio, pending.mode), spinner);
   return card;
 }
 
+function makeFailedActionButton(className, iconChar, labelText) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = className;
+  const icon = document.createElement('span');
+  icon.setAttribute('aria-hidden', 'true');
+  icon.textContent = iconChar;
+  const text = document.createElement('span');
+  text.className = 'result-failed-btn-text';
+  text.textContent = ` ${labelText}`;
+  button.append(icon, text);
+  return button;
+}
+
 function createFailedCard(job) {
-  // Thẻ thay mặt job THẤT BẠI: đứng nguyên chỗ spinner cũ, giữ lại cho tới khi
-  // user Retry (→ spinner) hoặc Delete (→ biến mất). Server giữ row lỗi 24h.
+  // Thẻ thay mặt job THẤT BẠI: giữ đúng khung chiều cao card thường, nội dung
+  // nằm trong overlay inset:0 để không làm phình chiều cao hàng/card.
   const card = document.createElement('div');
   card.className = 'result-card is-failed';
   card.setAttribute('role', 'status');
   card.setAttribute('aria-label', 'Tạo nội dung thất bại');
-  card.style.aspectRatio = aspectFromRatio(job.ratio) ?? (job.mode === 'video' ? '16 / 9' : '1 / 1');
+  const errorText = job.error || 'Không tạo được nội dung.';
+  card.title = errorText;
+  card.addEventListener('click', () => showToast(errorText));
+
+  const body = document.createElement('div');
+  body.className = 'result-failed-body';
   const label = document.createElement('span');
   label.className = 'result-failed-label';
   label.textContent = job.mode === 'video' ? 'Tạo video thất bại' : 'Tạo ảnh thất bại';
   const reason = document.createElement('span');
   reason.className = 'result-failed-reason';
-  const errorText = job.error || 'Không tạo được nội dung.';
   reason.textContent = errorText;
-  reason.title = errorText;
   const actions = document.createElement('div');
   actions.className = 'result-failed-actions';
-  const retry = makeButton('result-failed-retry', '↻ Thử lại');
+  const retry = makeFailedActionButton('result-failed-retry', '↻', 'Thử lại');
+  retry.setAttribute('aria-label', 'Thử lại');
   retry.title = 'Chạy lại với cùng tham số';
   retry.addEventListener('click', (event) => {
     event.stopPropagation();
     retryFailedJob(job.jobId);
   });
-  const remove = makeButton('result-failed-delete', 'Xóa');
+  const remove = makeFailedActionButton('result-failed-delete', '✕', 'Xóa');
+  remove.setAttribute('aria-label', 'Xóa');
   remove.title = 'Xóa thông báo lỗi này';
   remove.addEventListener('click', (event) => {
     event.stopPropagation();
     deleteFailedJob(job.jobId);
   });
   actions.append(retry, remove);
-  card.append(label, reason, actions);
+  body.append(label, reason, actions);
+  card.append(createCardAspectFrame(job.ratio, job.mode), body);
   return card;
 }
 
@@ -1532,11 +2088,20 @@ function noteLoadMerge(count) {
 function guessJobEntry(projectId, jobId, server, results) {
   // Job running trên server nhưng không có trong queue (tab/device khác hoặc
   // storage mất): dựng entry từ dữ liệu liệt kê để vẫn hiện pending card.
-  const mode = results.some((item) => item?.kind === 'video') ? 'video' : 'image';
+  const project = projects.find(({ id }) => id === projectId);
+  const projectResults = Array.isArray(project?.results) ? project.results : [];
+  const lastProjectItem = [...projectResults].reverse().find(
+    (item) => typeof item?.meta?.ratio === 'string' && /^\d+:\d+$/.test(item.meta.ratio),
+  );
+  const mode = results.some((item) => item?.kind === 'video')
+    ? 'video'
+    : (results.length === 0 && lastProjectItem?.kind === 'video')
+      ? 'video'
+      : 'image';
   const first = results.find((item) => typeof item?.meta?.ratio === 'string') ?? null;
   const ratio = typeof first?.meta?.ratio === 'string' && /^\d+:\d+$/.test(first.meta.ratio)
     ? first.meta.ratio
-    : mode === 'video' ? '16:9' : '1:1';
+    : lastProjectItem?.meta?.ratio ?? (mode === 'video' ? '16:9' : '1:1');
   return {
     projectId,
     jobId,
@@ -1817,11 +2382,18 @@ function setSignedIn(signedIn) {
   } else {
     projects = [];
     activeProject = null;
+    GEN_CAPS = null;
+    vmodeManual = false;
+    frameSlotsByProject.clear();
+    closeFramePicker();
+    clearDropHighlights();
     clearAllJobsLocal(); // giữ queue localStorage — sign-in lại sẽ reconcile tiếp
     closeProjectActions();
     closeVideoEditor();
     closeLightbox();
     exitExtendMode();
+    buildStaticRows();
+    renderGenDialog();
     renderProjects();
     showProjectContents();
     sidebarToggle.setAttribute('aria-expanded', 'false');
@@ -1833,8 +2405,7 @@ async function restoreSession() {
     const response = await request('/playground/session');
     if (!response.ok) return;
     setSignedIn(true);
-    await loadProjects();
-    loadGenOptions();
+    await Promise.all([loadGenOptions(), loadProjects()]);
     // Khôi phục queue job qua F5: mọi project còn entry trong localStorage.
     reconcileQueuedProjects();
   } catch {
@@ -1870,8 +2441,7 @@ form.addEventListener('submit', async (event) => {
     if (response.status === 204) {
       keyInput.value = '';
       setSignedIn(true);
-      await loadProjects();
-      loadGenOptions();
+      await Promise.all([loadGenOptions(), loadProjects()]);
       reconcileQueuedProjects();
     } else {
       const detail = await response.json().then((data) => data?.detail).catch(() => null);
@@ -2031,54 +2601,72 @@ function snapToLength(values, current) {
 function applyModelCapability(mode) {
   // Clamp the current state to what the selected model actually supports.
   const model = genSelectedModel(mode);
+  if (!model) return;
   const state = genState[mode];
+  state.model = model.id;
   if (Array.isArray(model.ratios) && model.ratios.length && !model.ratios.includes(state.ratio)) {
     state.ratio = model.ratios[0];
   }
   if (Array.isArray(model.res) && model.res.length && !model.res.includes(state.res)) {
     state.res = model.res[0];
   }
-  if (mode === 'video' && Array.isArray(model.length) && model.length.length) {
-    const { values } = lengthSliderSpec(model);
-    if (!values.includes(state.length)) state.length = snapToLength(values, state.length);
+  if (mode === 'video') {
+    if (Array.isArray(model.length) && model.length.length) {
+      const { values } = lengthSliderSpec(model);
+      if (!values.includes(state.length)) state.length = snapToLength(values, state.length);
+    }
+    if (state.vmode === 'frames' && model.frames !== true) {
+      vmodeManual = false;
+      state.vmode = model.refs === true && selectedImageItems().length > 0 ? 'ingredients' : 'text';
+    } else if (state.vmode === 'ingredients' && model.refs !== true) {
+      state.vmode = 'text';
+    }
   }
+}
+
+function defaultModelIcon(mode, model) {
+  if (typeof model.icon === 'string' && model.icon) return model.icon;
+  if (mode === 'image') {
+    const id = String(model.id || '').toLowerCase();
+    const base = String(model.base || '').toLowerCase();
+    if (id.includes('nano-banana') || base.includes('gemini-3') || base.includes('gemini-2.5')) {
+      return '🍌';
+    }
+  }
+  return undefined;
 }
 
 function mergeCapabilities(data) {
   const merged = {};
   for (const mode of ['image', 'video']) {
-    const serverModels = Array.isArray(data?.[mode]?.models) ? data[mode].models : [];
-    const byId = new Map(
-      serverModels
-        .filter((model) => model && typeof model.id === 'string')
-        .map((model) => [model.id, model])
-    );
-    const models = optionsFor(mode).models.map((model) => {
-      const server = byId.get(model.id);
-      if (!server) return { ...model };
-      return {
-        ...model,
-        label: typeof server.label === 'string' && server.label ? server.label : model.label,
-        // base alias cần cho mask key WM — server là nguồn sự thật.
-        base: typeof server.base === 'string' && server.base ? server.base : model.base,
-        ratios: Array.isArray(server.ratios) ? server.ratios : model.ratios,
-        res: server.res === undefined ? model.res : server.res,
-        length: server.length === undefined ? model.length : server.length,
-        refs: typeof server.refs === 'boolean' ? server.refs : model.refs,
-        frames: typeof server.frames === 'boolean' ? server.frames : model.frames,
-      };
-    });
-    // Server-only models stay selectable by being appended.
-    for (const server of serverModels) {
-      if (server && typeof server.id === 'string' && !models.some((model) => model.id === server.id)) {
-        models.push({ ...server });
-      }
-    }
+    const hasServerModels = Array.isArray(data?.[mode]?.models);
+    const serverModels = hasServerModels ? data[mode].models : GEN_OPTIONS[mode].models;
+    const staticById = new Map(GEN_OPTIONS[mode].models.map((m) => [m.id, m]));
+    const models = serverModels
+      .filter((server) => server && typeof server.id === 'string' && server.id)
+      .map((server) => {
+        const fallback = staticById.get(server.id);
+        const icon = defaultModelIcon(mode, server) ?? fallback?.icon;
+        return {
+          ...(fallback ?? {}),
+          ...server,
+          ...(icon ? { icon } : {}),
+          label: typeof server.label === 'string' && server.label ? server.label : (fallback?.label ?? server.id),
+          base: typeof server.base === 'string' && server.base ? server.base : (fallback?.base ?? server.id),
+          ratios: Array.isArray(server.ratios) ? server.ratios : (fallback?.ratios ?? GEN_OPTIONS[mode].ratios),
+        };
+      });
     merged[mode] = { models };
   }
   GEN_CAPS = merged;
+  if (!merged[genState.mode].models.length) {
+    const other = genState.mode === 'image' ? 'video' : 'image';
+    if (merged[other].models.length) genState.mode = other;
+  }
   for (const mode of ['image', 'video']) applyModelCapability(mode);
+  buildStaticRows();
   renderGenDialog();
+  renderComposerRefs();
 }
 
 async function loadGenOptions() {
@@ -2123,8 +2711,14 @@ function modelIconSpan(model) {
 
 function buildStaticRows() {
   for (const mode of ['image', 'video']) {
+    const ratioSet = [...GEN_OPTIONS[mode].ratios];
+    for (const model of optionsFor(mode)?.models ?? []) {
+      for (const ratio of model?.ratios ?? []) {
+        if (!ratioSet.includes(ratio)) ratioSet.push(ratio);
+      }
+    }
     genRatioRows[mode].replaceChildren(
-      ...GEN_OPTIONS[mode].ratios.map((ratio) => {
+      ...ratioSet.map((ratio) => {
         const button = makeButton('gen-ratio', '');
         button.dataset.ratio = ratio;
         button.setAttribute('aria-label', `Tỉ lệ ${ratio}`);
@@ -2167,9 +2761,18 @@ function renderModelRow(mode) {
     button.append(name);
     return;
   }
+  const model = genSelectedModel(mode);
+  if (!model) {
+    button.disabled = true;
+    button.title = 'API key hiện tại không có model cho chế độ này';
+    const name = document.createElement('span');
+    name.className = 'gen-model-name';
+    name.textContent = 'Không có model khả dụng';
+    button.append(name);
+    return;
+  }
   button.disabled = false;
   button.removeAttribute('title');
-  const model = genSelectedModel(mode);
   if (model.icon) button.append(modelIconSpan(model));
   const name = document.createElement('span');
   name.className = 'gen-model-name';
@@ -2212,6 +2815,7 @@ function renderModelList() {
         applyModelCapability(mode);
         genModelListOpen = false;
         renderGenDialog();
+        renderComposerRefs();
       });
       return option;
     })
@@ -2224,7 +2828,7 @@ function renderResRow() {
     genResRow.hidden = true;
     return;
   }
-  const resolutions = genSelectedModel('video').res;
+  const resolutions = genSelectedModel('video')?.res;
   if (!resolutions) {
     genResRow.hidden = true;
     return;
@@ -2244,7 +2848,7 @@ function renderResRow() {
 }
 
 function renderResImageRow() {
-  const resolutions = genSelectedModel('image').res;
+  const resolutions = genSelectedModel('image')?.res;
   if (!resolutions?.length) {
     genResImageRow.hidden = true;
     return;
@@ -2263,6 +2867,19 @@ function renderResImageRow() {
   genResImageRow.hidden = false;
 }
 
+function lengthTickValues(values) {
+  if (values.length <= 7) return values;
+  const min = values[0];
+  const max = values[values.length - 1];
+  const picked = new Set([min, max]);
+  const span = max - min;
+  const stride = span >= 10 ? 3 : 2;
+  for (let v = min; v < max; v += 1) {
+    if (values.includes(v) && (v - min) % stride === 0) picked.add(v);
+  }
+  return [...picked].sort((a, b) => a - b);
+}
+
 function renderLengthRow() {
   // Extend không dùng length — ẩn slider để khớp validate backend.
   if (genState.video.vmode === 'extend') {
@@ -2270,7 +2887,7 @@ function renderLengthRow() {
     return;
   }
   const model = genSelectedModel('video');
-  if (!Array.isArray(model.length) || !model.length.length) {
+  if (!model || !Array.isArray(model.length) || !model.length.length) {
     genLengthRow.hidden = true;
     return;
   }
@@ -2283,9 +2900,10 @@ function renderLengthRow() {
   genLengthSlider.step = String(step);
   genLengthSlider.value = String(genState.video.length);
   genLengthValue.textContent = `${genState.video.length} Sec`;
-  // Tick labels under the track: one per supported duration, centred on its snap position.
+  // Tick labels under the track: discrete ticks when compact (e.g. 4s/6s/8s), evenly spaced for wide ranges (3..15s).
+  const tickValues = lengthTickValues(values);
   genLengthTicks.replaceChildren(
-    ...values.map((value) => {
+    ...tickValues.map((value) => {
       const tick = document.createElement('span');
       tick.className = 'gen-length-tick';
       tick.dataset.value = String(value);
@@ -2307,7 +2925,7 @@ function renderGenDialog() {
   genBodies.image.hidden = genState.mode !== 'image';
   genBodies.video.hidden = genState.mode !== 'video';
   for (const mode of ['image', 'video']) {
-    const allowedRatios = genSelectedModel(mode).ratios;
+    const allowedRatios = genSelectedModel(mode)?.ratios;
     // Extend mode: ratio/qty bị khóa theo video gốc (chỉ render, không đụng
     // genState để thoát extend trả lại đúng lựa chọn tự do trước đó).
     const extendLocked = mode === 'video' && genState.video.vmode === 'extend';
@@ -2366,16 +2984,18 @@ function renderGenDialog() {
     const active = button.dataset.vmode === genState.video.vmode;
     button.classList.toggle('is-active', active);
     button.setAttribute('aria-pressed', String(active));
+    const videoModels = optionsFor('video')?.models ?? [];
     const videoModel = genSelectedModel('video');
+    const anyFramesModel = videoModels.some((m) => m?.frames === true);
     const imageCount = selectedImageItems().length;
     let enabled = true;
     let hint = '';
     if (button.dataset.vmode === 'frames') {
-      // Frames (i2v): 1-2 ảnh làm frame đầu/cuối — chỉ model hỗ trợ i2v.
-      enabled = videoModel?.frames === true && imageCount >= 1 && imageCount <= 2;
-      hint = videoModel?.frames === false
-        ? 'Model này không hỗ trợ Frames to Video'
-        : 'Chọn 1 ảnh (frame đầu) hoặc 2 ảnh (frame đầu + cuối) trong stage.';
+      // Frames luôn bấm được khi có ít nhất 1 model video hỗ trợ Frames (dù chưa chọn ảnh).
+      enabled = videoModel?.frames === true || anyFramesModel;
+      hint = enabled
+        ? 'Tạo video từ Start frame và End frame'
+        : 'Không có model nào hỗ trợ Frames to Video';
     } else if (button.dataset.vmode === 'ingredients') {
       // Ingredients chỉ mở khi model hỗ trợ và có 1-3 ảnh đang được chọn.
       enabled = videoModel?.refs === true && imageCount >= 1 && imageCount <= 3;
@@ -2428,13 +3048,21 @@ function updateGenTrigger() {
     genLabel.textContent = `${label} · ${extendState.ratio} · x1`;
     return;
   }
-  genLabel.textContent = `${model.label} · ${state.ratio} · x${state.qty}`;
+  if (!model) {
+    genLabel.textContent = 'Không có model khả dụng';
+    return;
+  }
+  const vmodeBadge = genState.mode === 'video' && genState.video.vmode !== 'text'
+    ? ` · ${genState.video.vmode === 'frames' ? 'Frames' : 'Ingredients'}`
+    : '';
+  genLabel.textContent = `${model.label}${vmodeBadge} · ${state.ratio} · x${state.qty}`;
 }
 
 function setGenDialogOpen(open) {
   genDialog.hidden = !open;
   genTrigger.setAttribute('aria-expanded', String(open));
   genModelListOpen = false;
+  if (open) closeFramePicker();
 }
 
 function setGenMode(mode) {
@@ -2442,8 +3070,10 @@ function setGenMode(mode) {
   // Rời tab video khi đang nối tiếp → hủy chế độ extend (chip + khóa).
   if (mode !== 'video' && genState.video.vmode === 'extend') exitExtendMode();
   genState.mode = mode;
+  if (mode === 'video') applyVideoVmodeAuto();
   genModelListOpen = false;
   renderGenDialog();
+  renderComposerRefs();
 }
 
 genTrigger.addEventListener('click', () => setGenDialogOpen(genDialog.hidden));
@@ -2452,17 +3082,24 @@ for (const tab of genTabs) {
 }
 for (const button of genVmodeRow.querySelectorAll('.gen-seg-btn')) {
   button.addEventListener('click', () => {
-    const videoModel = genSelectedModel('video');
+    const videoModels = optionsFor('video')?.models ?? [];
+    let videoModel = genSelectedModel('video');
     const imageCount = selectedImageItems().length;
     if (button.dataset.vmode === 'frames') {
       if (videoModel?.frames !== true) {
-        showToast('Model này không hỗ trợ Frames to Video.');
-        return;
+        const framesCapable = videoModels.find((m) => m?.frames === true);
+        if (!framesCapable) {
+          showToast('Không có model nào hỗ trợ Frames to Video.');
+          return;
+        }
+        genState.video.model = framesCapable.id;
+        applyModelCapability('video');
+        videoModel = genSelectedModel('video');
+        showToast(`Đã chuyển sang ${framesCapable.label} (hỗ trợ Frames).`);
       }
-      if (imageCount < 1 || imageCount > 2) {
-        showToast('Chọn 1 ảnh (frame đầu) hoặc 2 ảnh (frame đầu + cuối) trong stage.');
-        return;
-      }
+      vmodeManual = true;
+    } else {
+      vmodeManual = false;
     }
     if (button.dataset.vmode === 'ingredients') {
       if (videoModel?.refs !== true) {
@@ -2486,10 +3123,14 @@ for (const mode of ['image', 'video']) {
   });
 }
 genLengthSlider.addEventListener('input', () => {
-  genState.video.length = Number(genLengthSlider.value);
-  genLengthValue.textContent = `${genState.video.length} Sec`;
+  const model = genSelectedModel('video');
+  const raw = Number(genLengthSlider.value);
+  const snapped = Array.isArray(model?.length) && model.length.length ? snapToLength(model.length, raw) : raw;
+  genState.video.length = snapped;
+  genLengthSlider.value = String(snapped);
+  genLengthValue.textContent = `${snapped} Sec`;
   for (const tick of genLengthTicks.children) {
-    tick.classList.toggle('is-active', Number(tick.dataset.value) === genState.video.length);
+    tick.classList.toggle('is-active', Number(tick.dataset.value) === snapped);
   }
 });
 
@@ -2518,6 +3159,7 @@ function buildGeneratePayload(promptText) {
     }
   }
   const model = genSelectedModel(mode);
+  if (!model) return null;
   // Ảnh tham chiếu lấy từ selection trong stage (thứ tự chọn), chỉ item ảnh
   // còn tồn tại; cap theo mode/vmode (image 10, Frames 2, Ingredients 3).
   const selectedImages = selectedImageItems().map((item) => String(item.id));
@@ -2526,7 +3168,8 @@ function buildGeneratePayload(promptText) {
   if (mode === 'image') {
     references = model?.refs === true ? selectedImages.slice(0, MAX_REFS.image) : [];
   } else if (vmode === 'frames' && model?.frames === true) {
-    references = selectedImages.slice(0, 2);
+    const slots = getFrameSlots(activeProject);
+    references = [slots.startId, slots.endId].filter(Boolean);
   } else if (vmode === 'ingredients' && model?.refs === true) {
     references = selectedImages.slice(0, MAX_REFS.video);
   }
@@ -2578,6 +3221,28 @@ async function ensureActiveProject() {
 async function startGeneration() {
   const promptText = prompt.value.trim();
   if (!promptText) return;
+  if (!(genState.mode === 'video' && genState.video.vmode === 'extend') && !genSelectedModel(genState.mode)) {
+    showToast('API key hiện tại chưa có model khả dụng cho chế độ này.');
+    return;
+  }
+  if (isFramesMode()) {
+    const slots = getFrameSlots(activeProject);
+    if (!slots.startId) {
+      const startEl = frameSlotEls.start;
+      if (startEl) {
+        startEl.classList.remove('is-attention');
+        void startEl.offsetWidth;
+        startEl.classList.add('is-attention');
+        setTimeout(() => startEl.classList.remove('is-attention'), 1200);
+      }
+      showToast(
+        slots.endId
+          ? 'Cần chọn Start frame (hoặc bấm ⇄ để chuyển End frame sang Start).'
+          : 'Cần chọn ít nhất Start frame để tạo video Frames.',
+      );
+      return;
+    }
+  }
   // Composer không khoá khi có job chạy — nhưng 1 cú click/Enter không được bắn
   // 2 job: chặn double-fire trong 300ms (không phải khóa composer).
   const now = Date.now();
@@ -2585,7 +3250,9 @@ async function startGeneration() {
   lastSubmitAt = now;
   const project = await ensureActiveProject();
   if (!project) return;
-  const launched = await launchGeneration(project, buildGeneratePayload(promptText), { clearPrompt: true });
+  const payload = buildGeneratePayload(promptText);
+  if (!payload) return;
+  const launched = await launchGeneration(project, payload, { clearPrompt: true });
   // Job đã được server nhận → thoát chế độ nối tiếp (chip tắt, composer tự do).
   // Bắn lỗi thì giữ nguyên extend để chỉnh prompt gửi lại.
   if (launched) exitExtendMode();
@@ -2704,6 +3371,9 @@ document.addEventListener('click', (event) => {
   if (!genDialog.hidden && !path.includes(genDialog) && !path.includes(genTrigger)) {
     setGenDialogOpen(false);
   }
+  if (framePicker && !framePicker.hidden && !path.includes(framePicker) && !path.some((n) => n instanceof Element && n.classList?.contains('frame-slot'))) {
+    closeFramePicker();
+  }
 });
 document.addEventListener('keydown', (event) => {
   // Gallery ảnh đang mở: ←/→ duyệt ảnh (mới hơn / cũ hơn).
@@ -2720,6 +3390,7 @@ document.addEventListener('keydown', (event) => {
     }
   }
   if (event.key !== 'Escape') return;
+  clearDropHighlights();
   if (marqueeState) {
     event.preventDefault();
     endMarquee();
@@ -2760,6 +3431,11 @@ document.addEventListener('keydown', (event) => {
   if (openActions) {
     event.preventDefault();
     closeProjectActions(true);
+  }
+  if (framePicker && !framePicker.hidden) {
+    event.preventDefault();
+    closeFramePicker();
+    return;
   }
   if (!genDialog.hidden) {
     event.preventDefault();
@@ -2892,7 +3568,7 @@ async function deleteProjectItem(projectId, itemId) {
   }
 }
 
-async function createReferenceItem(projectId, { name, image }) {
+async function createReferenceItem(projectId, { name, image }, { silent = false } = {}) {
   try {
     const response = await request(projectPath(projectId, '/items'), {
       method: 'POST',
@@ -2907,7 +3583,7 @@ async function createReferenceItem(projectId, { name, image }) {
       return null;
     }
     const project = replaceProjectWith(await response.json());
-    showToast('Đã thêm ảnh tham chiếu.');
+    if (!silent) showToast('Đã thêm ảnh tham chiếu.');
     return project;
   } catch {
     showToast('Không tạo được ảnh tham chiếu.');
@@ -2986,22 +3662,37 @@ async function downloadItem(item) {
   }
 }
 
-// Menu trên card chỉ còn đúng 4 mục: Đổi tên / Re-use prompt / Download / Xóa.
-// (Tham chiếu/bôi chọn dùng marquee selection; mask làm qua panel Mask WM.)
+// Menu trên card: Bật/tắt tham chiếu (với ảnh) / Đổi tên / Re-use prompt / Download / Xóa.
 function openResultMenuFor(toggle, item) {
   const projectId = activeProject;
   if (!projectId) return;
   const actions = document.createElement('div');
   actions.className = 'result-menu-list';
+  const refSelected = item.kind === 'image' && isSelected(item.id);
+  const refToggleBtn = item.kind === 'image'
+    ? makeButton('result-menu-item', refSelected ? 'Bỏ tham chiếu' : 'Dùng làm tham chiếu')
+    : null;
   const renameBtn = makeButton('result-menu-item', 'Đổi tên');
   const promptText = typeof item.meta?.prompt === 'string' ? item.meta.prompt.trim() : '';
   const reuseBtn = promptText ? makeButton('result-menu-item', 'Re-use prompt') : null;
   const downloadBtn = makeButton('result-menu-item', 'Download');
   const deleteBtn = makeButton('result-menu-item is-danger', 'Xóa');
-  actions.append(renameBtn, ...(reuseBtn ? [reuseBtn] : []), downloadBtn, deleteBtn);
+  actions.append(
+    ...(refToggleBtn ? [refToggleBtn] : []),
+    renameBtn,
+    ...(reuseBtn ? [reuseBtn] : []),
+    downloadBtn,
+    deleteBtn,
+  );
   document.body.append(actions);
   positionMenu(actions, toggle.getBoundingClientRect());
 
+  if (refToggleBtn) {
+    refToggleBtn.addEventListener('click', () => {
+      closeResultMenu();
+      setSelected(item.id, !refSelected);
+    });
+  }
   renameBtn.addEventListener('click', () => {
     closeResultMenu();
     openItemDialog('rename', projectId, item);
@@ -3168,9 +3859,12 @@ function maskCanvasPoint(event) {
 function modelBaseFor(modelId) {
   if (typeof modelId !== 'string') return null;
   for (const mode of ['image', 'video']) {
-    const spec = (optionsFor(mode)?.models ?? []).find((model) => model.id === modelId);
+    const spec = (optionsFor(mode)?.models ?? []).find(
+      (model) => model.id === modelId || model.base === modelId,
+    );
     if (typeof spec?.base === 'string' && spec.base) return spec.base;
   }
+  if (modelId === 'nano-banana-pro') return 'gemini-3.0-pro-image';
   return null;
 }
 

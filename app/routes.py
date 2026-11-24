@@ -265,10 +265,14 @@ async def playground_session(
             if await client.validate_key(api_key):
                 owner_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
                 raw_token = secrets.token_urlsafe(48)
+                fetched_models = getattr(client, "last_models", None)
+                if fetched_models is not None:
+                    generation.cache_models_for_credentials(api_key, api_url, fetched_models)
                 await playground_db.create_session(
                     _cookie_hash(raw_token), owner_hash, int(time.time()) + PLAYGROUND_SESSION_TTL,
                     api_key=api_key,
                     api_url=api_url,
+                    models=fetched_models,
                 )
                 response.set_cookie(
                     PLAYGROUND_SESSION_COOKIE,
@@ -309,7 +313,12 @@ async def playground_logout(
 ):
     await _require_playground_mutation(request, request.headers.get("x-playground-request"))
     if playground_session:
-        await playground_db.revoke_session(_cookie_hash(playground_session))
+        token_hash = _cookie_hash(playground_session)
+        owner_hash = await playground_db.owner_for_session(token_hash)
+        if owner_hash:
+            api_key, api_url = await playground_db.api_credentials_for_owner(owner_hash)
+            generation.invalidate_models_cache(api_key, api_url)
+        await playground_db.revoke_session(token_hash)
     response.delete_cookie(PLAYGROUND_SESSION_COOKIE, path="/playground")
     response.status_code = 204
     return _no_store(response)
@@ -390,7 +399,10 @@ async def playground_delete_project(
 
 @router.get("/playground/api/gen-options", include_in_schema=False)
 async def playground_gen_options(owner_hash: str = Security(_require_playground_owner)):
-    return _response(generation.playground_gen_options())
+    raw_models = await generation.get_models_for_session(
+        playground_db, owner_hash, refresh=True
+    )
+    return _response(generation.playground_gen_options(raw_models))
 
 
 def _resolve_generate_params(project: dict, params: dict) -> dict:
@@ -460,7 +472,8 @@ async def playground_generate(
             status_code=429,
             detail="Đang có quá nhiều job chạy cùng lúc — vui lòng đợi job hiện tại xong.",
         )
-    params = generation.validate_generate_payload(payload.model_dump())
+    raw_models = await generation.get_models_for_session(playground_db, owner_hash, refresh=False)
+    params = generation.validate_generate_payload(payload.model_dump(), raw_models=raw_models)
     params = _resolve_generate_params(project, params)
 
     api_key, api_url = await playground_db.api_credentials_for_owner(owner_hash)
@@ -553,8 +566,9 @@ async def playground_retry_job(
             status_code=429,
             detail="Đang có quá nhiều job chạy cùng lúc — vui lòng đợi job hiện tại xong.",
         )
+    raw_models = await generation.get_models_for_session(playground_db, owner_hash, refresh=False)
     try:
-        params = generation.validate_generate_payload(stored)
+        params = generation.validate_generate_payload(stored, raw_models=raw_models)
     except HTTPException as exc:
         raise HTTPException(
             status_code=409,
@@ -937,10 +951,17 @@ async def playground_create_sample(
             detail="Đang tạo ảnh ví dụ — vui lòng đợi lần tạo hiện tại xong.",
             headers=_NO_STORE_HEADERS,
         )
+    raw_models = await generation.get_models_for_session(playground_db, owner_hash, refresh=False)
     _sample_generating.add(owner_hash)
     try:
+        kwargs = {"raw_models": raw_models} if raw_models is not None else {}
         info = await generation.generate_watermark_sample(
-            payload.model, payload.ratio, payload.res or "1K", api_key, api_url
+            payload.model,
+            payload.ratio,
+            payload.res or "1K",
+            api_key,
+            api_url,
+            **kwargs,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

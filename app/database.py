@@ -49,7 +49,8 @@ class PlaygroundDatabase:
                         owner_hash TEXT NOT NULL,
                         expires_at INTEGER NOT NULL,
                         api_key TEXT,
-                        api_url TEXT
+                        api_url TEXT,
+                        models_json TEXT
                     );
                     CREATE INDEX IF NOT EXISTS idx_playground_sessions_expiry
                         ON playground_sessions(expires_at);
@@ -90,6 +91,10 @@ class PlaygroundDatabase:
                     await db.execute(
                         "ALTER TABLE playground_sessions ADD COLUMN api_url TEXT"
                     )
+                if "models_json" not in columns:
+                    await db.execute(
+                        "ALTER TABLE playground_sessions ADD COLUMN models_json TEXT"
+                    )
                 # Job lưu params gốc (additive) để nút Retry chạy lại đúng combo —
                 # DB cũ thiếu cột thì thêm; job cũ không có params là không retry được.
                 cursor = await db.execute("PRAGMA table_info(playground_jobs)")
@@ -121,16 +126,18 @@ class PlaygroundDatabase:
         expires_at: int,
         api_key: str | None = None,
         api_url: str | None = None,
+        models: list[dict] | None = None,
     ):
         await self._initialize()
+        models_json = json.dumps(models) if models is not None else None
         async with self._connect() as db:
             await db.execute(
                 "DELETE FROM playground_sessions WHERE expires_at <= ?", (int(time.time()),)
             )
             await db.execute(
-                "INSERT INTO playground_sessions(token_hash, owner_hash, expires_at, api_key, api_url) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (token_hash, owner_hash, expires_at, api_key, api_url),
+                "INSERT INTO playground_sessions(token_hash, owner_hash, expires_at, api_key, api_url, models_json) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (token_hash, owner_hash, expires_at, api_key, api_url, models_json),
             )
             await db.commit()
 
@@ -153,19 +160,47 @@ class PlaygroundDatabase:
         Session cũ trước khi thêm api_url trả api_url=None → caller fallback về
         endpoint mặc định theo env config.
         """
+        api_key, api_url, _models = await self.session_credentials_and_models(owner_hash)
+        return api_key, api_url
+
+    async def session_credentials_and_models(
+        self, owner_hash: str
+    ) -> tuple[str | None, str | None, list[dict] | None]:
+        """(api_key, api_url, raw_models) của session còn hạn gần nhất."""
         await self._initialize()
         now = int(time.time())
         async with self._connect() as db:
             cursor = await db.execute(
-                "SELECT api_key, api_url FROM playground_sessions "
+                "SELECT api_key, api_url, models_json FROM playground_sessions "
                 "WHERE owner_hash = ? AND expires_at > ? AND api_key IS NOT NULL "
                 "ORDER BY expires_at DESC LIMIT 1",
                 (owner_hash, now),
             )
             row = await cursor.fetchone()
         if row is None:
-            return None, None
-        return row["api_key"], row["api_url"]
+            return None, None, None
+        models = None
+        if row["models_json"]:
+            try:
+                parsed = json.loads(row["models_json"])
+                if isinstance(parsed, list):
+                    models = parsed
+            except (TypeError, ValueError):
+                models = None
+        return row["api_key"], row["api_url"], models
+
+    async def update_session_models(self, owner_hash: str, models: list[dict] | None):
+        """Lưu danh sách model /v1/models mới nhất vào session đang hoạt động."""
+        await self._initialize()
+        now = int(time.time())
+        models_json = json.dumps(models) if models is not None else None
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE playground_sessions SET models_json = ? "
+                "WHERE owner_hash = ? AND expires_at > ?",
+                (models_json, owner_hash, now),
+            )
+            await db.commit()
 
     async def revoke_session(self, token_hash: str):
         await self._initialize()

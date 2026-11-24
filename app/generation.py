@@ -12,12 +12,14 @@ Các hàm compose được copy nguyên logic từ flow2api src/main.py:632-957 
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import mimetypes
 import re
 import shutil
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -65,6 +67,108 @@ PLAYGROUND_VIDEO_MODELS = (
     {"id": "veo-3.1-fast-ultra", "label": "Veo 3.1 - Fast Ultra", "base": "veo_3_1_t2v_fast_ultra"},
     {"id": "veo-3.1-quality", "label": "Veo 3.1 - Quality", "base": "veo_3_1_t2v"},
 )
+
+_IMAGE_ORIENT_TO_RATIO = {
+    "landscape": "16:9",
+    "portrait": "9:16",
+    "square": "1:1",
+    "four-three": "4:3",
+    "four_three": "4:3",
+    "three-four": "3:4",
+    "three_four": "3:4",
+}
+
+_KNOWN_IMAGE_FAMILIES = {
+    "gemini-3.0-pro-image": {
+        "id": "gemini-3.0-pro-image",
+        "base": "gemini-3.0-pro-image",
+        "label": "Nano Banana Pro",
+        "default_res": ["1K", "2K"],
+    },
+    "nano-banana-pro": {
+        "id": "nano-banana-pro",
+        "base": "gemini-3.0-pro-image",
+        "label": "Nano Banana Pro",
+        "default_res": ["1K", "2K"],
+    },
+    "gemini-3.1-flash-image": {
+        "id": "gemini-3.1-flash-image",
+        "base": "gemini-3.1-flash-image",
+        "label": "Nano Banana 2",
+        "default_res": ["1K", "2K"],
+    },
+    "nano-banana-2": {
+        "id": "nano-banana-2",
+        "base": "gemini-3.1-flash-image",
+        "label": "Nano Banana 2",
+        "default_res": ["1K", "2K"],
+    },
+    "nano-banana-2.1": {
+        "id": "nano-banana-2.1",
+        "base": "gemini-3.1-flash-image",
+        "label": "Nano Banana 2.1",
+        "default_res": ["1K", "2K"],
+    },
+    "gemini-3.1-flash-lite-image": {
+        "id": "gemini-3.1-flash-lite-image",
+        "base": "gemini-3.1-flash-lite-image",
+        "label": "Nano Banana 2 Lite",
+        "default_res": ["1K", "2K"],
+    },
+    "nano-banana-2-lite": {
+        "id": "nano-banana-2-lite",
+        "base": "gemini-3.1-flash-lite-image",
+        "label": "Nano Banana 2 Lite",
+        "default_res": ["1K", "2K"],
+    },
+    "gemini-2.5-flash-image": {
+        "id": "gemini-2.5-flash-image",
+        "base": "gemini-2.5-flash-image",
+        "label": "Nano Banana",
+        "default_res": ["1K"],
+    },
+    "gemini_2_5_flash_image": {
+        "id": "gemini_2_5_flash_image",
+        "base": "gemini-2.5-flash-image",
+        "label": "Nano Banana",
+        "default_res": ["1K"],
+    },
+    "nano-banana": {
+        "id": "nano-banana",
+        "base": "gemini-2.5-flash-image",
+        "label": "Nano Banana",
+        "default_res": ["1K"],
+    },
+}
+
+_IMAGE_VARIANT_RE = re.compile(
+    r"^(?P<stem>.+?)(?:[-_](?P<orient>landscape|portrait|square|four[-_]three|three[-_]four))?(?:[-_](?P<res>1k|2k|4k))?$",
+    re.IGNORECASE,
+)
+
+_IMAGE_HINT_RE = re.compile(
+    r"(?:nano[-_]banana|imagen|[-_]image(?:$|[-_])|gpt[-_]image|dall[-_]e|flux|sdxl|stable[-_]diffusion|midjourney|ideogram|recraft|seedream)",
+    re.IGNORECASE,
+)
+_VIDEO_HINT_RE = re.compile(
+    r"(?:^veo[-_]|[-_](?:t2v|i2v|r2v|video)(?:$|[-_])|interpolation[-_]lite|^omni[-_]|sora|kling|hailuo|minimax|runway|luma|seedance|^wan[-_0-9]|pika|hunyuan[-_]video)",
+    re.IGNORECASE,
+)
+_VIDEO_VARIANT_RE = re.compile(
+    r"^(?P<stem>.+?)(?:[-_](?P<orient>landscape|portrait))?(?:[-_](?P<dur>\d+s))?(?:[-_](?P<res>720p|1080p|4k))?$",
+    re.IGNORECASE,
+)
+
+# Các họ video model sắp/đã discontinue — bỏ qua khỏi dropdown video động
+# (vẫn giữ extend variant ở tầng resolve nếu user nối tiếp video cũ).
+_DISCONTINUED_VIDEO_FAMILIES = frozenset({
+    "veo-3.1-fast",
+    "veo-3.1-fast-ultra",
+    "veo-3.1-fast-relaxed",
+    "veo-3.1-fast-ultra-relaxed",
+    "veo-3.1-quality",
+    "omni-1.1-flash",
+})
 
 
 def _playground_orientation(ratio: str) -> str:
@@ -314,18 +418,902 @@ def _playground_video_model_options() -> list[dict]:
     return models
 
 
-def playground_gen_options() -> dict:
+def _humanize_model_label(stem: str) -> str:
+    """Chuyển model id (vd 'imagen-4.0-generate') thành label dễ đọc."""
+    tokens = {
+        "veo": "Veo",
+        "gemini": "Gemini",
+        "imagen": "Imagen",
+        "omni": "Omni",
+        "sora": "Sora",
+        "kling": "Kling",
+        "flux": "FLUX",
+        "sdxl": "SDXL",
+        "gpt": "GPT",
+        "pro": "Pro",
+        "flash": "Flash",
+        "lite": "Lite",
+        "fast": "Fast",
+        "ultra": "Ultra",
+        "relaxed": "Relaxed",
+        "quality": "Quality",
+        "image": "Image",
+        "video": "Video",
+        "r2v": "R2V",
+        "i2v": "I2V",
+        "t2v": "T2V",
+        "2k": "2K",
+        "4k": "4K",
+        "1080p": "1080p",
+        "720p": "720p",
+    }
+    parts = [part for part in re.split(r"[-_]+", stem.strip()) if part]
+    if not parts:
+        return stem
+    rendered = []
+    for part in parts:
+        low = part.lower()
+        rendered.append(tokens.get(low, part.capitalize() if part.isalpha() else part))
+    return " ".join(rendered)
+
+
+def _extract_model_res_from_entry(entry: dict) -> list[str] | None:
+    raw = entry.get("res") or entry.get("resolutions") or entry.get("supported_sizes")
+    if isinstance(raw, (list, tuple)):
+        cleaned = [str(item).strip() for item in raw if str(item).strip()]
+        if cleaned:
+            return cleaned
+    return None
+
+
+def _extract_model_ratios_from_entry(entry: dict, default_ratios: list[str]) -> list[str]:
+    raw = entry.get("ratios") or entry.get("aspect_ratios")
+    if isinstance(raw, (list, tuple)):
+        cleaned = [str(item).strip() for item in raw if str(item).strip()]
+        if cleaned:
+            return cleaned
+    aspect = str(entry.get("aspect_ratio") or "").upper()
+    if "PORTRAIT_THREE_FOUR" in aspect:
+        return ["3:4"]
+    if "FOUR_THREE" in aspect:
+        return ["4:3"]
+    if "SQUARE" in aspect:
+        return ["1:1"]
+    if "PORTRAIT" in aspect:
+        return ["9:16"]
+    if "LANDSCAPE" in aspect:
+        return ["16:9"]
+    return list(default_ratios)
+
+
+def _extract_model_lengths_from_entry(entry: dict) -> list[int] | None:
+    raw = entry.get("length") or entry.get("lengths") or entry.get("durations")
+    if isinstance(raw, (list, tuple)):
+        cleaned = []
+        for item in raw:
+            try:
+                val = int(str(item).rstrip("sS"))
+                if val > 0 and val not in cleaned:
+                    cleaned.append(val)
+            except ValueError:
+                continue
+        if cleaned:
+            return sorted(cleaned)
+    return None
+
+
+def _label_from_model_description(entry: dict) -> str | None:
+    """Lấy tên model sạch từ trường description của /v1/models (bỏ suffix · 4s · landscape / I2V)."""
+    raw_desc = entry.get("description")
+    if not isinstance(raw_desc, str):
+        return None
+    head = raw_desc.split(" · ")[0].strip()
+    if not head:
+        return None
+    cleaned = re.sub(r"\s+(?:I2V|R2V|T2V|Extend)$", "", head, flags=re.IGNORECASE).strip()
+    return cleaned or None
+
+
+def _is_discontinued_video_family(family_id: str) -> bool:
+    low = family_id.lower()
+    return (
+        low in _DISCONTINUED_VIDEO_FAMILIES
+        or re.match(r"^omni[-_]1[._][01](?:$|[-_])", low) is not None
+    )
+
+
+def _strip_video_qualifiers(model_id: str) -> tuple[str, str, dict]:
+    """Tách stem + sub_type + attributes khỏi video id bất kể thứ tự token.
+
+    Ví dụ:
+      ``omni-1.2-flash-3s-landscape`` -> (``omni-1.2-flash``, ``t2v``, {dur=3, ratio='16:9'})
+      ``custom-video-portrait-6s-1080p`` -> (``custom-video``, ``t2v``, {dur=6, ratio='9:16', res='1080p'})
+      ``omni-1.2-flash-i2v-5s-portrait`` -> (``omni-1.2-flash``, ``i2v``, {dur=5, ratio='9:16'})
+    """
+    stem = model_id.strip()
+    ratio = None
+    duration = None
+    res = None
+    sub_type = None
+    had_qualifier = False
+
+    token_re = re.compile(
+        r"^(?P<head>.+?)[-_](?P<tok>landscape|portrait|4k|1080p|720p|\d+s|t2v|i2v|r2v|extend)$",
+        re.IGNORECASE,
+    )
+    while True:
+        match = token_re.match(stem)
+        if not match:
+            break
+        tok = match.group("tok").lower()
+        next_head = match.group("head")
+        if tok == "landscape" and ratio is None:
+            ratio = "16:9"
+        elif tok == "portrait" and ratio is None:
+            ratio = "9:16"
+        elif tok == "4k" and res is None:
+            res = "4K"
+        elif tok == "1080p" and res is None:
+            res = "1080p"
+        elif tok == "720p" and res is None:
+            res = "720p"
+        elif tok.endswith("s") and tok[:-1].isdigit() and duration is None:
+            duration = int(tok[:-1])
+        elif tok in ("t2v", "i2v", "r2v", "extend") and sub_type is None:
+            sub_type = tok
+        else:
+            break
+        had_qualifier = True
+        stem = next_head
+
+    return stem, (sub_type or "t2v"), {
+        "ratio": ratio,
+        "duration": duration,
+        "res": res,
+        "had_qualifier": had_qualifier,
+    }
+
+
+def _classify_raw_model_type(entry: dict) -> str | None:
+    """Xác định model từ /v1/models là 'image', 'video' hay bỏ qua (None)."""
+    explicit = str(entry.get("type") or "").strip().lower()
+    if explicit in ("image", "video"):
+        return explicit
+    model_id = str(entry.get("id") or "").strip()
+    low = model_id.lower()
+    if not low or "upsampler" in low or low in ("veo_3_1_extend", "veo_3_1_extend_portrait"):
+        return None
+    if str(entry.get("video_type") or "").strip().lower() == "extend" or re.search(r"(?:^|[-_])extend(?:$|[-_])", low):
+        return None
+    cfg = MODEL_CONFIG.get(model_id)
+    if cfg and cfg.get("type") in ("image", "video"):
+        return cfg["type"]
+    if model_id in VIDEO_BASE_MODELS:
+        return "video"
+    modalities = entry.get("output_modalities") or entry.get("modalities")
+    if isinstance(modalities, (list, tuple)):
+        mods = {str(m).strip().lower() for m in modalities}
+        if "video" in mods:
+            return "video"
+        if "image" in mods and "text" not in mods:
+            return "image"
+    if _VIDEO_HINT_RE.search(low):
+        return "video"
+    if _IMAGE_HINT_RE.search(low):
+        return "image"
+    return None
+
+
+def _is_extend_video_entry(entry: dict) -> bool:
+    model_id = str(entry.get("id") or "").strip().lower()
+    if not model_id or "upsampler" in model_id:
+        return False
+    if str(entry.get("video_type") or "").strip().lower() == "extend":
+        return True
+    return bool(re.search(r"(?:^|[-_])extend(?:$|[-_])", model_id))
+
+
+def _video_family_from_id(model_id: str) -> tuple[str, str, str, str] | None:
+    """Map video model id -> (family_id, catalog_base, label, sub_type).
+
+    Trả None nếu không thuộc họ Veo 3.1 chuẩn của flow2api.
+    sub_type: 't2v' | 'i2v' | 'r2v' | 'extend'.
+    """
+    low = model_id.lower()
+    if not (low.startswith("veo_3_1") or low.startswith("veo-3.1")):
+        return None
+    # Model tên riêng của gateway/upstream khác (vd veo-3.1-fast-generate-001) giữ nguyên làm model riêng.
+    known_aliases = {
+        "veo-3.1-lite", "veo_3_1_lite",
+        "veo-3.1-fast", "veo_3_1_fast",
+        "veo-3.1-fast-ultra", "veo_3_1_fast_ultra",
+        "veo-3.1-fast-relaxed", "veo_3_1_fast_relaxed",
+        "veo-3.1-fast-ultra-relaxed", "veo_3_1_fast_ultra_relaxed",
+        "veo-3.1-quality", "veo_3_1_quality", "veo_3_1_t2v",
+        "veo_3_1_extend", "veo_3_1_extend_portrait",
+    }
+    is_catalog_shape = (
+        low in known_aliases
+        or low.startswith(("veo_3_1_t2v", "veo_3_1_i2v", "veo_3_1_r2v", "veo_3_1_interpolation", "veo_3_1_extend"))
+        or re.match(
+            r"^veo[-_]3[._]1[-_](?:lite|fast|quality)[-_](?:t2v|i2v|r2v|extend|landscape|portrait|\d+s)",
+            low,
+        )
+        is not None
+    )
+    if not is_catalog_shape:
+        return None
+    if re.search(r"(?:^|[-_])extend(?:$|[-_])", low):
+        sub_type = "extend"
+    elif re.search(r"(?:^|[-_])i2v(?:$|[-_])|interpolation", low):
+        sub_type = "i2v"
+    elif re.search(r"(?:^|[-_])r2v(?:$|[-_])", low):
+        sub_type = "r2v"
+    else:
+        sub_type = "t2v"
+
+    if re.search(r"(?:^|[-_])lite(?:$|[-_])", low):
+        return ("veo-3.1-lite", "veo_3_1_t2v_lite", "Veo 3.1 - Lite", sub_type)
+    if re.search(r"(?:^|[-_])ultra(?:$|[-_])", low) and "relaxed" in low:
+        return (
+            "veo-3.1-fast-ultra-relaxed",
+            "veo_3_1_t2v_fast_ultra_relaxed",
+            "Veo 3.1 - Fast Ultra Relaxed",
+            sub_type,
+        )
+    if re.search(r"(?:^|[-_])fast(?:$|[-_])", low) and "relaxed" in low:
+        return (
+            "veo-3.1-fast-relaxed",
+            "veo_3_1_t2v_fast_relaxed",
+            "Veo 3.1 - Fast Relaxed",
+            sub_type,
+        )
+    if re.search(r"(?:^|[-_])ultra(?:$|[-_])", low):
+        return ("veo-3.1-fast-ultra", "veo_3_1_t2v_fast_ultra", "Veo 3.1 - Fast Ultra", sub_type)
+    if re.search(r"(?:^|[-_])fast(?:$|[-_])", low):
+        return ("veo-3.1-fast", "veo_3_1_t2v_fast", "Veo 3.1 - Fast", sub_type)
+    return ("veo-3.1-quality", "veo_3_1_t2v", "Veo 3.1 - Quality", sub_type)
+
+
+def _parse_video_variant_attrs(model_id: str, entry: dict) -> dict:
+    """Đọc orientation / duration / res từ video variant id hoặc metadata entry."""
+    low = model_id.lower()
+    orient = None
+    if "portrait" in low:
+        orient = "9:16"
+    elif "landscape" in low:
+        orient = "16:9"
+    else:
+        aspect = str(entry.get("aspect_ratio") or "").upper()
+        if "PORTRAIT" in aspect:
+            orient = "9:16"
+        elif "LANDSCAPE" in aspect:
+            orient = "16:9"
+
+    dur_match = re.search(r"(?:^|[-_])(\d+)s(?:$|[-_])", low)
+    duration = int(dur_match.group(1)) if dur_match else None
+
+    res = None
+    if re.search(r"(?:^|[-_])4k(?:$|[-_])", low):
+        res = "4K"
+    elif re.search(r"(?:^|[-_])1080p(?:$|[-_])", low):
+        res = "1080p"
+    elif re.search(r"(?:^|[-_])720p(?:$|[-_])", low):
+        res = "720p"
+
+    images_minmax = None
+    if "interpolation" in low:
+        images_minmax = (2, 2)
+    elif entry.get("min_images") is not None or entry.get("max_images") is not None:
+        images_minmax = (
+            int(entry.get("min_images", 1)),
+            int(entry.get("max_images", 3)),
+        )
+    elif model_id in MODEL_CONFIG and MODEL_CONFIG[model_id].get("supports_images"):
+        cfg = MODEL_CONFIG[model_id]
+        images_minmax = (int(cfg.get("min_images", 1)), int(cfg.get("max_images", 2)))
+
+    return {
+        "id": model_id,
+        "ratio": orient,
+        "duration": duration,
+        "res": res,
+        "images_minmax": images_minmax,
+    }
+
+
+def _normalize_video_family_id(model_id: str | None) -> str | None:
+    if not model_id:
+        return None
+    veo = _video_family_from_id(model_id)
+    if veo is not None:
+        return veo[0]
+    stem, _sub, _attrs = _strip_video_qualifiers(model_id)
+    return stem or model_id
+
+
+def _build_dynamic_gen_options(raw_models: list[dict]) -> tuple[dict, dict]:
+    """Dựng (public_options, resolver_meta) từ danh sách model thực của /v1/models.
+
+    ``public_options`` giữ đúng schema hợp đồng của /playground/api/gen-options.
+    ``resolver_meta`` lưu map ẩn theo (mode, model_id) để validate/compose dùng
+    đúng model ID thực mà endpoint + API key đã cấp.
+    """
+    raw_id_set = {
+        str(entry.get("id") or "").strip()
+        for entry in raw_models
+        if isinstance(entry, dict) and str(entry.get("id") or "").strip()
+    }
+    image_groups: dict[str, dict] = {}
+    video_groups: dict[str, dict] = {}
+    extend_variants: list[dict] = []
+
+    for entry in raw_models:
+        if not isinstance(entry, dict):
+            continue
+        model_id = str(entry.get("id") or "").strip()
+        if not model_id:
+            continue
+
+        if _is_extend_video_entry(entry):
+            veo_ext = _video_family_from_id(model_id)
+            ext_attrs = _parse_video_variant_attrs(model_id, entry)
+            if veo_ext is not None:
+                ext_family = veo_ext[0]
+            else:
+                ext_stem, _sub, qattrs = _strip_video_qualifiers(model_id)
+                ext_family = ext_stem
+                if ext_attrs["ratio"] is None:
+                    ext_attrs["ratio"] = qattrs["ratio"]
+                if ext_attrs["duration"] is None:
+                    ext_attrs["duration"] = qattrs["duration"]
+                if ext_attrs["res"] is None:
+                    ext_attrs["res"] = qattrs["res"]
+            extend_variants.append(
+                {
+                    **ext_attrs,
+                    "family_id": ext_family,
+                    "discontinued": _is_discontinued_video_family(ext_family),
+                }
+            )
+            continue
+
+        kind = _classify_raw_model_type(entry)
+        desc_label = _label_from_model_description(entry)
+
+        if kind == "image":
+            match = _IMAGE_VARIANT_RE.match(model_id)
+            stem = match.group("stem") if match else model_id
+            orient = match.group("orient").lower() if match and match.group("orient") else None
+            res_token = match.group("res").upper() if match and match.group("res") else None
+            # Không tách nhầm nếu vừa không có orient vừa không có res và bản thân stem == model_id.
+            known = _KNOWN_IMAGE_FAMILIES.get(stem.lower()) or _KNOWN_IMAGE_FAMILIES.get(model_id.lower())
+            if known:
+                group_key = known["base"]
+                group_id = model_id if (not orient and not res_token and model_id.lower() == known["id"]) else known["id"]
+                base = known["base"]
+                label = desc_label or known["label"]
+                default_res = known["default_res"]
+            else:
+                group_key = stem.lower()
+                group_id = stem
+                base = stem
+                explicit_label = entry.get("display_name") or entry.get("label") or entry.get("name")
+                label = (
+                    desc_label
+                    or (
+                        str(explicit_label).strip()
+                        if (isinstance(explicit_label, str) and explicit_label.strip() and not orient and not res_token)
+                        else _humanize_model_label(stem)
+                    )
+                )
+                default_res = ["1K", "2K"] if ("gemini" in group_key or stem in MODEL_SUPPORTED_SIZES) else ["1K"]
+
+            group = image_groups.get(group_key)
+            if group is None:
+                group = {
+                    "id": group_id,
+                    "label": label,
+                    "has_desc_label": bool(desc_label),
+                    "base": base,
+                    "default_res": default_res,
+                    "has_base": False,
+                    "base_raw_id": None,
+                    "ratios_seen": set(),
+                    "res_seen": set(),
+                    "variants": {},  # (ratio, res_upper) -> raw model_id
+                    "refs": True,
+                    "explicit_ratios": None,
+                    "explicit_res": None,
+                }
+                image_groups[group_key] = group
+            elif desc_label and not group["has_desc_label"]:
+                group["label"] = desc_label
+                group["has_desc_label"] = True
+
+            if not orient and not res_token:
+                group["has_base"] = True
+                group["base_raw_id"] = model_id
+                # Khi server trả trực tiếp alias như "nano-banana-pro" hoặc "gemini-3.0-pro-image",
+                # ưu tiên giữ id chính là id đó.
+                group["id"] = model_id
+                if desc_label:
+                    group["label"] = desc_label
+                    group["has_desc_label"] = True
+                exp_ratios = entry.get("ratios") or entry.get("aspect_ratios")
+                if isinstance(exp_ratios, (list, tuple)) and exp_ratios:
+                    group["explicit_ratios"] = _extract_model_ratios_from_entry(entry, list(PLAYGROUND_IMAGE_RATIOS))
+                exp_res = _extract_model_res_from_entry(entry)
+                if exp_res:
+                    group["explicit_res"] = exp_res
+                if entry.get("refs") is False or entry.get("supports_images") is False:
+                    group["refs"] = False
+            else:
+                ratio = _IMAGE_ORIENT_TO_RATIO.get(orient) if orient else None
+                res_val = res_token or "1K"
+                if ratio:
+                    group["ratios_seen"].add(ratio)
+                    group["variants"][(ratio, res_val)] = model_id
+                group["res_seen"].add(res_val)
+
+        elif kind == "video":
+            veo = _video_family_from_id(model_id)
+            if veo is not None:
+                family_id, catalog_base, fallback_label, sub_type = veo
+                group_key = family_id
+            else:
+                stem, parsed_sub, qattrs = _strip_video_qualifiers(model_id)
+                group_key = stem.lower()
+                family_id = stem
+                catalog_base = stem
+                explicit_label = entry.get("display_name") or entry.get("label") or entry.get("name")
+                is_plain = not qattrs["had_qualifier"]
+                fallback_label = (
+                    str(explicit_label).strip()
+                    if isinstance(explicit_label, str) and explicit_label.strip() and is_plain
+                    else _humanize_model_label(stem)
+                )
+                vt = str(entry.get("video_type") or "").strip().lower()
+                sub_type = vt if vt in ("t2v", "i2v", "r2v") else (parsed_sub if parsed_sub in ("t2v", "i2v", "r2v") else "t2v")
+
+            if _is_discontinued_video_family(family_id):
+                continue
+
+            label = desc_label or fallback_label
+            group = video_groups.get(group_key)
+            if group is None:
+                group = {
+                    "id": family_id,
+                    "label": label,
+                    "has_desc_label": bool(desc_label),
+                    "base": catalog_base,
+                    "is_known_veo": veo is not None,
+                    "raw_ids": set(),
+                    "by_type": {"t2v": [], "i2v": [], "r2v": []},
+                    "has_base_t2v": False,
+                    "base_raw_id": None,
+                    "explicit_ratios": None,
+                    "explicit_res": None,
+                    "explicit_lengths": None,
+                    "explicit_refs": None,
+                    "explicit_frames": None,
+                }
+                video_groups[group_key] = group
+            elif desc_label and (not group["has_desc_label"] or sub_type == "t2v"):
+                if not group["has_desc_label"]:
+                    group["label"] = desc_label
+                    group["has_desc_label"] = True
+
+            group["raw_ids"].add(model_id)
+            attrs = _parse_video_variant_attrs(model_id, entry)
+            group["by_type"][sub_type].append(attrs)
+
+            is_unqualified = (
+                model_id == family_id
+                or model_id == catalog_base
+                or (
+                    attrs["ratio"] is None
+                    and attrs["duration"] is None
+                    and attrs["res"] is None
+                    and sub_type == "t2v"
+                )
+            )
+            if is_unqualified:
+                group["has_base_t2v"] = True
+                if group["base_raw_id"] is None or model_id == catalog_base:
+                    group["base_raw_id"] = model_id
+                if desc_label:
+                    group["label"] = desc_label
+                    group["has_desc_label"] = True
+                if entry.get("ratios") or entry.get("aspect_ratios"):
+                    group["explicit_ratios"] = _extract_model_ratios_from_entry(entry, list(PLAYGROUND_VIDEO_RATIOS))
+                exp_res = _extract_model_res_from_entry(entry)
+                if exp_res:
+                    group["explicit_res"] = exp_res
+                exp_len = _extract_model_lengths_from_entry(entry)
+                if exp_len:
+                    group["explicit_lengths"] = exp_len
+                if isinstance(entry.get("refs"), bool):
+                    group["explicit_refs"] = entry["refs"]
+                if isinstance(entry.get("frames"), bool):
+                    group["explicit_frames"] = entry["frames"]
+
+    image_models: list[dict] = []
+    video_models: list[dict] = []
+    meta_index: dict[tuple[str, str], dict] = {}
+
+    for group in image_groups.values():
+        if group["explicit_ratios"]:
+            ratios = group["explicit_ratios"]
+        elif group["has_base"] or not group["ratios_seen"]:
+            ratios = list(PLAYGROUND_IMAGE_RATIOS)
+        else:
+            ratios = [r for r in PLAYGROUND_IMAGE_RATIOS if r in group["ratios_seen"]] or list(PLAYGROUND_IMAGE_RATIOS)
+
+        if group["explicit_res"]:
+            res = group["explicit_res"]
+        elif group["has_base"] and not group["res_seen"]:
+            res = list(group["default_res"])
+        elif group["res_seen"]:
+            order = ("1K", "2K", "4K")
+            seen = set(group["res_seen"])
+            if group["has_base"]:
+                seen.update(group["default_res"])
+            res = [r for r in order if r in seen]
+        else:
+            res = list(group["default_res"])
+
+        entry_out = {
+            "id": group["id"],
+            "label": group["label"],
+            "base": group["base"],
+            "ratios": ratios,
+            "res": res,
+            "refs": group["refs"],
+        }
+        image_models.append(entry_out)
+        meta_index[("image", group["id"])] = {
+            "kind": "image",
+            "has_base": group["has_base"],
+            "base_raw_id": group["base_raw_id"],
+            "variants": group["variants"],
+            "raw_id_set": raw_id_set,
+        }
+
+    for group in video_groups.values():
+        base = group["base"]
+        t2v_items = group["by_type"]["t2v"]
+        i2v_items = group["by_type"]["i2v"]
+        r2v_items = group["by_type"]["r2v"]
+        all_items = t2v_items + i2v_items + r2v_items
+
+        # Nếu là Veo 3.1 trong catalog tĩnh và endpoint liệt kê base key (không chỉ liệt kê riêng variant)
+        in_catalog = base in VIDEO_BASE_MODELS or any(
+            k.startswith(base) for k in MODEL_CONFIG if isinstance(k, str)
+        )
+        has_catalog_t2v = base in VIDEO_BASE_MODELS and _video_combo_supported(base, None, None)
+
+        if group["explicit_ratios"]:
+            ratios = group["explicit_ratios"]
+        else:
+            seen_ratios = {it["ratio"] for it in all_items if it["ratio"]}
+            has_neutral = any(it["ratio"] is None for it in all_items)
+            if has_neutral or not seen_ratios:
+                ratios = list(PLAYGROUND_VIDEO_RATIOS)
+            else:
+                ratios = [r for r in PLAYGROUND_VIDEO_RATIOS if r in seen_ratios]
+
+        if group["explicit_lengths"]:
+            lengths = group["explicit_lengths"]
+        else:
+            seen_durs = sorted({it["duration"] for it in all_items if it["duration"]})
+            if group["has_base_t2v"] and has_catalog_t2v:
+                cat_lengths = [l for l in PLAYGROUND_LENGTHS if _video_combo_supported(base, l, None)]
+                lengths = sorted(set(cat_lengths) | set(seen_durs)) or None
+            elif seen_durs:
+                lengths = seen_durs
+            else:
+                lengths = None
+
+        if group["explicit_res"]:
+            res = group["explicit_res"]
+        else:
+            seen_res = {it["res"] for it in all_items if it["res"]}
+            if group["has_base_t2v"] and has_catalog_t2v:
+                probe_lengths = lengths or [None]
+                ups = [
+                    r for r in PLAYGROUND_VIDEO_UPSAMPLE_RES
+                    if all(_video_combo_supported(base, l, r) for l in probe_lengths)
+                ]
+                res_set = set(ups) | ({r for r in seen_res if r != "720p"})
+                res = [PLAYGROUND_VIDEO_BASE_RES, *[r for r in ("1080p", "4K") if r in res_set]] if res_set else None
+            elif seen_res - {"720p"}:
+                res = [PLAYGROUND_VIDEO_BASE_RES, *[r for r in ("1080p", "4K") if r in seen_res]]
+            else:
+                res = None
+
+        # Khả năng refs (Ingredients) và frames (Start/End frame)
+        if group["explicit_refs"] is not None:
+            refs = group["explicit_refs"]
+        elif r2v_items:
+            refs = True
+        elif group["has_base_t2v"] and group["is_known_veo"]:
+            if base == "veo_3_1_t2v_fast_ultra_relaxed":
+                refs = any(k.startswith("veo_3_1_r2v_fast") and "ultra_relaxed" in k for k in MODEL_CONFIG)
+            elif in_catalog:
+                refs = _model_reference_supported("video", base)
+            else:
+                refs = False
+        elif not group["is_known_veo"]:
+            refs = True
+        else:
+            refs = False
+
+        if group["explicit_frames"] is not None:
+            frames = group["explicit_frames"]
+        elif i2v_items:
+            frames = True
+        elif group["has_base_t2v"] and group["is_known_veo"]:
+            if base == "veo_3_1_t2v_fast_ultra_relaxed":
+                frames = any(k.startswith("veo_3_1_i2v") and "ultra_relaxed" in k for k in MODEL_CONFIG)
+            elif in_catalog:
+                frames = _video_frames_supported(base)
+            else:
+                frames = False
+        elif not group["is_known_veo"]:
+            frames = True
+        else:
+            frames = False
+
+        entry_out = {
+            "id": group["id"],
+            "label": group["label"],
+            "base": base,
+            "ratios": ratios,
+            "res": res,
+            "length": lengths,
+            "refs": refs,
+            "frames": frames,
+        }
+        video_models.append(entry_out)
+        meta_index[("video", group["id"])] = {
+            "kind": "video",
+            "has_base_t2v": group["has_base_t2v"],
+            "base_raw_id": group["base_raw_id"],
+            "is_known_veo": group["is_known_veo"],
+            "raw_ids": group["raw_ids"],
+            "by_type": group["by_type"],
+            "raw_id_set": raw_id_set,
+        }
+
+    if extend_variants:
+        meta_index[("video_extend", "default")] = {
+            "variants": extend_variants,
+            "raw_id_set": raw_id_set,
+        }
+
+    return {"image": {"models": image_models}, "video": {"models": video_models}}, meta_index
+
+
+def playground_gen_options(raw_models: list[dict] | None = None) -> dict:
+    if raw_models is not None:
+        options, _index = _build_dynamic_gen_options(raw_models)
+        return options
     return {
         "image": {"models": _playground_image_model_options()},
         "video": {"models": _playground_video_model_options()},
     }
 
 
-def validate_generate_payload(payload: dict) -> dict:
+def _pick_dynamic_video_variant(
+    items: list[dict],
+    ratio: str,
+    length: int | None,
+    res: str | None,
+    images: int | None = None,
+    *,
+    allow_nearest_duration: bool = False,
+) -> str | None:
+    """Chọn variant khớp nhất trong nhóm raw /v1/models cho (ratio, length, res, images)."""
+    if not items:
+        return None
+    upsampling = res if res and res.lower() in ("1080p", "4k") else None
+
+    def score(item: dict, *, relax_duration: bool) -> tuple[int, int, int, int, int] | None:
+        if item["ratio"] is not None and item["ratio"] != ratio:
+            return None
+        if images is not None and item["images_minmax"] is not None:
+            lo, hi = item["images_minmax"]
+            if not lo <= images <= hi:
+                return None
+        if upsampling:
+            if item["res"] is not None and item["res"].lower() != upsampling.lower():
+                return None
+        elif item["res"] is not None and item["res"].lower() != "720p":
+            return None
+        dur = item["duration"]
+        if not relax_duration and length is not None and dur is not None and dur != length:
+            return None
+
+        if length is not None and dur is not None:
+            dur_exact = 1 if dur == length else 0
+            # Gần nhất (chỉ dùng khi relax_duration=True); đồng khoảng cách ưu tiên thời lượng lớn hơn.
+            dur_closeness = -abs(dur - length) * 100 + dur
+        elif dur is None:
+            dur_exact = 0
+            dur_closeness = -10_000
+        else:
+            dur_exact = 0
+            dur_closeness = dur
+
+        return (
+            1 if item["ratio"] == ratio else 0,
+            1 if (upsampling and item["res"] and item["res"].lower() == upsampling.lower()) else (1 if not upsampling and item["res"] is None else 0),
+            dur_exact,
+            dur_closeness,
+            1 if (images is not None and item["images_minmax"] is not None) else 0,
+        )
+
+    for relax in (False, True) if allow_nearest_duration else (False,):
+        ranked = []
+        for item in items:
+            s = score(item, relax_duration=relax)
+            if s is not None:
+                ranked.append((s, item["id"]))
+        if ranked:
+            ranked.sort(key=lambda pair: pair[0], reverse=True)
+            return ranked[0][1]
+    return None
+
+
+def _resolve_dynamic_extend_target(
+    meta_extend: dict | None,
+    source_model: str | None,
+    ratio: str,
+) -> tuple[str, dict] | None:
+    """Resolve model extend thực từ /v1/models cho video nối tiếp."""
+    variants = (meta_extend or {}).get("variants") or []
+    if not variants:
+        return _compose_video_extend_request(ratio)
+    desired_family = _normalize_video_family_id(source_model)
+    best: tuple[tuple[int, int, int], str] | None = None
+    for item in variants:
+        if item["ratio"] is not None and item["ratio"] != ratio:
+            continue
+        score = (
+            1 if desired_family and item["family_id"] == desired_family else 0,
+            1 if not item.get("discontinued") else 0,
+            1 if item["ratio"] == ratio else 0,
+        )
+        if best is None or score > best[0]:
+            best = (score, item["id"])
+    if best:
+        return best[1], {"aspectRatio": ratio}
+    return _compose_video_extend_request(ratio)
+
+
+def _resolve_dynamic_target(
+    meta: dict,
+    spec_entry: dict,
+    mode: str,
+    ratio: str,
+    res: str | None,
+    length: int | None,
+    vmode: str,
+    image_count: int,
+) -> tuple[str, dict] | None:
+    """Resolve (request_model, generationConfig) cho model từ /v1/models."""
+    raw_id_set = meta["raw_id_set"]
+    if mode == "image":
+        res_upper = (res or "1K").upper()
+        res_lower = res_upper.lower()
+        gen_config = {"aspectRatio": ratio, "imageSize": res_lower}
+        variants = meta.get("variants") or {}
+        exact = variants.get((ratio, res_upper))
+        if exact:
+            return exact, gen_config
+        if meta.get("has_base") and meta.get("base_raw_id"):
+            return meta["base_raw_id"], gen_config
+        fallback = variants.get((ratio, "1K")) or next(
+            (mid for (r, _sz), mid in variants.items() if r == ratio), None
+        )
+        if fallback:
+            return fallback, gen_config
+        return spec_entry["base"], gen_config
+
+    # Video mode
+    base = spec_entry["base"]
+    orientation = _playground_orientation(ratio)
+    gen_config = {"aspectRatio": ratio}
+    if res and res.lower() in ("1080p", "4k"):
+        gen_config["imageSize"] = res.lower()
+
+    if vmode == "frames":
+        # Ưu tiên variant i2v thực của endpoint (khớp exact duration, thiếu thì chọn i2v gần nhất).
+        matched = _pick_dynamic_video_variant(
+            meta["by_type"]["i2v"], ratio, length, res, images=image_count, allow_nearest_duration=True
+        )
+        if matched:
+            return matched, gen_config
+        cat = _compose_video_frames_request(base, length, res, ratio, images=image_count)
+        if cat:
+            cat_model, cat_cfg = cat
+            if cat_model in raw_id_set or meta.get("base_raw_id") == base:
+                return cat_model, cat_cfg
+        # Model ngoài Veo (vd omni-1.2-flash) không tách riêng -i2v- -> map đúng t2v theo (ratio, length).
+        if spec_entry.get("frames") and not meta.get("is_known_veo"):
+            t2v_matched = _pick_dynamic_video_variant(
+                meta["by_type"]["t2v"], ratio, length, res, allow_nearest_duration=True
+            )
+            if t2v_matched:
+                return t2v_matched, gen_config
+            if meta.get("base_raw_id"):
+                return meta["base_raw_id"], gen_config
+            return spec_entry["id"], gen_config
+        if meta.get("base_raw_id"):
+            return meta["base_raw_id"], gen_config
+        return None
+
+    if vmode == "ingredients":
+        matched = _pick_dynamic_video_variant(
+            meta["by_type"]["r2v"], ratio, length, res, images=image_count, allow_nearest_duration=True
+        )
+        if matched:
+            return matched, gen_config
+        cat = _compose_video_reference_request(base, length, res, ratio)
+        if cat:
+            cat_model, cat_cfg = cat
+            if cat_model in raw_id_set or meta.get("base_raw_id") == base:
+                return cat_model, cat_cfg
+        if spec_entry.get("refs") and not meta.get("is_known_veo"):
+            t2v_matched = _pick_dynamic_video_variant(
+                meta["by_type"]["t2v"], ratio, length, res, allow_nearest_duration=True
+            )
+            if t2v_matched:
+                return t2v_matched, gen_config
+            if meta.get("base_raw_id"):
+                return meta["base_raw_id"], gen_config
+            return spec_entry["id"], gen_config
+        if meta.get("base_raw_id"):
+            return meta["base_raw_id"], gen_config
+        return None
+
+    # Text (t2v): ưu tiên variant t2v thực khớp đúng (ratio, length, res) trong /v1/models
+    matched = _pick_dynamic_video_variant(meta["by_type"]["t2v"], ratio, length, res)
+    if matched:
+        return matched, gen_config
+    cat = _compose_video_request(base, length, res, ratio)
+    if cat:
+        cat_model, cat_cfg = cat
+        plain_key = VIDEO_BASE_MODELS.get(cat_model, {}).get(orientation)
+        if cat_model in raw_id_set:
+            return cat_model, cat_cfg
+        if plain_key and plain_key in raw_id_set:
+            return plain_key, cat_cfg
+        if meta.get("base_raw_id") == base:
+            return cat_model, cat_cfg
+    nearest_t2v = _pick_dynamic_video_variant(
+        meta["by_type"]["t2v"], ratio, length, res, allow_nearest_duration=True
+    )
+    if nearest_t2v:
+        return nearest_t2v, gen_config
+    if meta.get("base_raw_id"):
+        return meta["base_raw_id"], gen_config
+    # Fallback cho model chỉ liệt kê r2v/i2v (vd veo-3.1-lite-r2v-8s-*)
+    any_matched = _pick_dynamic_video_variant(
+        meta["by_type"]["r2v"] + meta["by_type"]["i2v"], ratio, length, res, allow_nearest_duration=True
+    )
+    if any_matched:
+        return any_matched, gen_config
+    return spec_entry["id"], gen_config
+
+
+def validate_generate_payload(payload: dict, raw_models: list[dict] | None = None) -> dict:
     """Validate payload generate từ frontend; trả params dict cho job nền.
 
     vmode cho video: 'text' (t2v) / 'frames' (i2v 1-2 ảnh đầu+cuối) /
     'ingredients' (r2v 1-3 ảnh tham chiếu) / 'extend' (nối tiếp video đã tạo).
+    ``raw_models`` (khi có) là danh sách từ GET /v1/models của session hiện tại.
     """
     from fastapi import HTTPException
 
@@ -386,13 +1374,21 @@ def validate_generate_payload(payload: dict) -> dict:
     if vmode == "extend" and qty != 1:
         raise HTTPException(status_code=400, detail="Extend chỉ hỗ trợ 1 kết quả mỗi lần.")
 
-    options = playground_gen_options()
+    if raw_models is not None:
+        options, resolver_meta = _build_dynamic_gen_options(raw_models)
+    else:
+        options, resolver_meta = playground_gen_options(), None
+
     spec_entry = next(
         (item for item in options[mode]["models"] if item["id"] == payload.get("model")), None
     )
     if spec_entry is None and vmode != "extend":
         raise HTTPException(status_code=400, detail="Model không được hỗ trợ cho chế độ này.")
-    spec = _playground_model_spec(mode, payload.get("model")) if spec_entry else None
+    spec = (
+        spec_entry
+        if resolver_meta is not None
+        else (_playground_model_spec(mode, payload.get("model")) if spec_entry else None)
+    )
 
     ratio = (payload.get("ratio") or "").strip()
     if spec_entry is not None and ratio not in spec_entry["ratios"]:
@@ -417,33 +1413,69 @@ def validate_generate_payload(payload: dict) -> dict:
     ):
         length = None
 
-    # Probe key compose thật với combo đã degrade — không có key phù hợp thì
-    # chặn sớm thay vì để job chạy rồi mới lỗi.
-    if mode == "video" and vmode == "frames":
-        if not spec_entry.get("frames"):
+    resolved_model = None
+    resolved_config = None
+    if resolver_meta is not None and vmode == "extend":
+        target = _resolve_dynamic_extend_target(
+            resolver_meta.get(("video_extend", "default")),
+            payload.get("model"),
+            ratio,
+        )
+        if target is None:
+            raise HTTPException(
+                status_code=400, detail="Endpoint hiện tại không hỗ trợ Extend cho tỉ lệ này."
+            )
+        resolved_model, resolved_config = target
+    elif resolver_meta is not None and spec_entry is not None and vmode != "extend":
+        meta = resolver_meta.get((mode, spec_entry["id"]))
+        if mode == "video" and vmode == "frames" and not spec_entry.get("frames"):
             raise HTTPException(
                 status_code=400, detail="Model này không hỗ trợ Frames to Video (i2v)."
             )
-        if _compose_video_frames_request(
-            spec["base"], length, res, ratio, images=len(references)
-        ) is None:
-            raise HTTPException(
-                status_code=400, detail="Model này không hỗ trợ tổ hợp Frames đã chọn."
-            )
-    if mode == "video" and vmode == "ingredients":
-        if not spec_entry.get("refs"):
+        if mode == "video" and vmode == "ingredients" and not spec_entry.get("refs"):
             raise HTTPException(
                 status_code=400, detail="Model này không hỗ trợ ảnh tham chiếu."
             )
-        if _compose_video_reference_request(spec["base"], length, res, ratio) is None:
-            raise HTTPException(
-                status_code=400, detail="Model này không hỗ trợ tổ hợp ảnh tham chiếu đã chọn."
+        target = (
+            _resolve_dynamic_target(
+                meta, spec_entry, mode, ratio, res, length, vmode, len(references)
             )
+            if meta
+            else None
+        )
+        if target is None:
+            raise HTTPException(
+                status_code=400, detail="Model này không hỗ trợ tổ hợp tham số đã chọn."
+            )
+        resolved_model, resolved_config = target
+    elif vmode != "extend":
+        # Probe key compose thật với combo đã degrade — không có key phù hợp thì
+        # chặn sớm thay vì để job chạy rồi mới lỗi.
+        if mode == "video" and vmode == "frames":
+            if not spec_entry.get("frames"):
+                raise HTTPException(
+                    status_code=400, detail="Model này không hỗ trợ Frames to Video (i2v)."
+                )
+            if _compose_video_frames_request(
+                spec["base"], length, res, ratio, images=len(references)
+            ) is None:
+                raise HTTPException(
+                    status_code=400, detail="Model này không hỗ trợ tổ hợp Frames đã chọn."
+                )
+        if mode == "video" and vmode == "ingredients":
+            if not spec_entry.get("refs"):
+                raise HTTPException(
+                    status_code=400, detail="Model này không hỗ trợ ảnh tham chiếu."
+                )
+            if _compose_video_reference_request(spec["base"], length, res, ratio) is None:
+                raise HTTPException(
+                    status_code=400, detail="Model này không hỗ trợ tổ hợp ảnh tham chiếu đã chọn."
+                )
 
-    return {
+    result = {
         "mode": mode,
         "model": payload.get("model") or "",
-        "base": spec["base"] if spec else f"veo_3_1_extend",
+        "base": spec["base"] if spec else "veo_3_1_extend",
         "ratio": ratio,
         "res": res,
         "length": length,
@@ -453,6 +1485,10 @@ def validate_generate_payload(payload: dict) -> dict:
         "references": references,
         "extend_item_id": str(payload.get("extend_item_id") or "").strip() or None,
     }
+    if resolved_model:
+        result["resolved_model"] = resolved_model
+        result["resolved_config"] = resolved_config
+    return result
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -748,6 +1784,83 @@ async def trim_playground_video_item(source_item: dict, start: float, end: float
 # ──────────────────────────────────────────────────────────────────
 
 
+def _parse_models_payload(payload) -> list[dict] | None:
+    """Chuẩn hóa JSON từ GET /v1/models (OpenAI list / models / array) thành list[dict]."""
+    if isinstance(payload, dict):
+        items = payload.get("data")
+        if not isinstance(items, list):
+            items = payload.get("models")
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        items = None
+    if not isinstance(items, list):
+        return None
+    parsed: list[dict] = []
+    for item in items:
+        if isinstance(item, str) and item.strip():
+            parsed.append({"id": item.strip()})
+        elif isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip():
+            parsed.append({**item, "id": item["id"].strip()})
+    return parsed
+
+
+# Cache ngắn hạn danh sách model theo (endpoint, api_key_hash) để vừa đăng nhập
+# xong gọi /gen-options dùng ngay kết quả /v1/models mà không lặp request thừa.
+_MODELS_CACHE_TTL_SEC = 10.0
+_models_cache: dict[tuple[str, str], tuple[float, list[dict]]] = {}
+
+
+def _models_cache_key(api_key: str, api_url: str | None) -> tuple[str, str]:
+    base = (api_url or FLOW2API_BASE_URL).strip().rstrip("/")
+    key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    return (base, key_hash)
+
+
+def cache_models_for_credentials(api_key: str, api_url: str | None, models: list[dict] | None):
+    if not api_key or models is None:
+        return
+    _models_cache[_models_cache_key(api_key, api_url)] = (time.monotonic(), list(models))
+
+
+def invalidate_models_cache(api_key: str | None, api_url: str | None):
+    if not api_key:
+        return
+    _models_cache.pop(_models_cache_key(api_key, api_url), None)
+
+
+async def get_models_for_session(
+    playground_db,
+    owner_hash: str,
+    *,
+    refresh: bool = False,
+) -> list[dict] | None:
+    """Lấy danh sách model thực của session hiện tại (ưu tiên cache/DB → /v1/models).
+
+    Khi ``refresh=True`` (endpoint /gen-options lúc login/F5): gọi /v1/models
+    nếu cache TTL đã hết, cập nhật DB + cache; nếu upstream tạm lỗi thì rơi về
+    list đã lưu trong session (chỉ fallback static catalog khi chưa từng fetch).
+    """
+    api_key, api_url, stored_models = await playground_db.session_credentials_and_models(owner_hash)
+    if not api_key:
+        return None
+    ck = _models_cache_key(api_key, api_url)
+    cached = _models_cache.get(ck)
+    now = time.monotonic()
+    if cached and (not refresh or (now - cached[0]) <= _MODELS_CACHE_TTL_SEC):
+        return cached[1]
+    if refresh:
+        client = get_flow_client(api_url)
+        fetched = await client.fetch_models(api_key)
+        if fetched is not None:
+            cache_models_for_credentials(api_key, api_url, fetched)
+            await playground_db.update_session_models(owner_hash, fetched)
+            return fetched
+    if stored_models is not None:
+        cache_models_for_credentials(api_key, api_url, stored_models)
+    return stored_models
+
+
 class FlowClient:
     """Client gọi flow2api (engine generation) qua OpenAI-compatible API."""
 
@@ -760,6 +1873,8 @@ class FlowClient:
         )
         # Phân loại lỗi lần check key gần nhất: None / 'unreachable' / 'unauthorized'.
         self.last_check_error: str | None = None
+        # Danh sách raw model từ lần GET /v1/models gần nhất (nếu hợp lệ).
+        self.last_models: list[dict] | None = None
 
     async def aclose(self):
         await self._client.aclose()
@@ -770,20 +1885,52 @@ class FlowClient:
         Trả None nếu hợp lệ; 'unreachable' nếu không kết nối được endpoint;
         'unauthorized' nếu endpoint từ chối key. Kết quả cũng lưu vào
         ``last_check_error`` để caller phân loại lỗi khi validate_key trả False.
+        Đồng thời lưu ``last_models`` để session lấy luôn danh sách model thực.
         """
+        self.last_models = None
         try:
             response = await self._client.get(
-                "/v1/models", headers={"Authorization": f"Bearer {api_key}"}
+                "/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=min(FLOW2API_TIMEOUT, 15.0),
             )
         except httpx.HTTPError as exc:
             logger.error("Không kết nối được flow2api %s: %s", self.base_url, exc)
             self.last_check_error = "unreachable"
             return self.last_check_error
-        self.last_check_error = None if response.status_code == 200 else "unauthorized"
+        if response.status_code == 200:
+            self.last_check_error = None
+            try:
+                self.last_models = _parse_models_payload(response.json())
+            except ValueError:
+                self.last_models = None
+            return None
+        self.last_check_error = "unauthorized"
         return self.last_check_error
 
     async def validate_key(self, api_key: str) -> bool:
         return await self.check_key(api_key) is None
+
+    async def fetch_models(self, api_key: str) -> list[dict] | None:
+        """Gọi GET /v1/models lấy danh sách model thực của API key; None nếu lỗi."""
+        try:
+            response = await self._client.get(
+                "/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=min(FLOW2API_TIMEOUT, 15.0),
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("Không lấy được /v1/models từ %s: %s", self.base_url, exc)
+            return None
+        if response.status_code != 200:
+            return None
+        try:
+            parsed = _parse_models_payload(response.json())
+        except ValueError:
+            return None
+        if parsed is not None:
+            self.last_models = parsed
+        return parsed
 
     async def generate(self, api_key: str, body: dict) -> dict:
         """POST /v1/chat/completions (non-stream); trả payload JSON."""
@@ -904,7 +2051,10 @@ def _compose_chat_body(params: dict, reference_data_urls: list[str]) -> tuple[st
     mode = params["mode"]
     vmode = params.get("vmode") or "text"
     stream = mode == "video"
-    if mode == "image":
+    if params.get("resolved_model"):
+        request_model = str(params["resolved_model"])
+        gen_config = dict(params.get("resolved_config") or {"aspectRatio": params["ratio"]})
+    elif mode == "image":
         res = (params.get("res") or "1K").lower()
         request_model = params["base"]
         gen_config = {"aspectRatio": params["ratio"], "imageSize": res}
@@ -1143,7 +2293,12 @@ SAMPLE_PROMPT = (
 
 
 async def generate_watermark_sample(
-    model_id: str, ratio: str, res: str, api_key: str, api_url: str | None = None
+    model_id: str,
+    ratio: str,
+    res: str,
+    api_key: str,
+    api_url: str | None = None,
+    raw_models: list[dict] | None = None,
 ) -> dict:
     """Tạo 1 ảnh ví dụ cho model image + ratio + res để làm nền vẽ mask WM.
 
@@ -1153,8 +2308,13 @@ async def generate_watermark_sample(
     lưu vào thư mục mask (prefix sample_) và dùng lại cho các lần mở editor sau.
     Trả {"key", "filename", "url"} — url là endpoint GET sample cho frontend.
     """
+    if raw_models is not None:
+        options, resolver_meta = _build_dynamic_gen_options(raw_models)
+    else:
+        options, resolver_meta = playground_gen_options(), None
+
     entry = next(
-        (item for item in playground_gen_options()["image"]["models"] if item["id"] == model_id),
+        (item for item in options["image"]["models"] if item["id"] == model_id),
         None,
     )
     if entry is None or not isinstance(entry.get("base"), str) or not entry["base"]:
@@ -1177,6 +2337,12 @@ async def generate_watermark_sample(
         "length": None,
         "prompt": SAMPLE_PROMPT,
     }
+    if resolver_meta is not None:
+        meta = resolver_meta.get(("image", entry["id"]))
+        if meta:
+            target = _resolve_dynamic_target(meta, entry, "image", ratio, res, None, "text", 0)
+            if target:
+                params["resolved_model"], params["resolved_config"] = target
     client = get_flow_client(api_url)
     _request_model, body = _compose_chat_body(params, [])
     payload = await client.generate(api_key, body)

@@ -50,7 +50,14 @@
     </aside>
     <section class="stage" aria-label="Không gian tạo">
       <div id="results-grid" class="results-grid" aria-label="Kết quả" hidden></div>
-      <p id="results-empty" class="results-empty" hidden>Chưa có kết quả — mô tả ý tưởng bên dưới để bắt đầu.</p>
+      <p id="results-empty" class="results-empty" hidden>Chưa có kết quả — mô tả ý tưởng bên dưới hoặc kéo thả tệp ảnh vào đây để làm tham chiếu.</p>
+      <div id="stage-drop-overlay" class="stage-drop-overlay" hidden aria-hidden="true">
+        <div class="stage-drop-card">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          <strong>Thả tệp ảnh vào Playground</strong>
+          <span>Chỉ lưu tại Playground để dùng làm tham chiếu — không tải lên Flow.</span>
+        </div>
+      </div>
     </section>
 
     <div id="selection-toolbar" class="selection-toolbar" role="toolbar" aria-label="Thao tác với item đã chọn" hidden>
@@ -66,9 +73,69 @@
           <button id="extend-chip-cancel" class="extend-chip-cancel" type="button" aria-label="Hủy nối tiếp — quay lại chế độ tạo tự do">×</button>
         </div>
         <div id="composer-refs" class="composer-refs" hidden></div>
+        <div id="composer-frames" class="composer-frames" hidden>
+          <div class="composer-frames-head">
+            <span class="composer-frames-badge">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="10" height="8" rx="1.5"/><rect x="11" y="11" width="10" height="8" rx="1.5"/></svg>
+              Frames to Video
+            </span>
+            <span class="composer-frames-hint">Start frame bắt buộc · End frame tùy chọn</span>
+            <button id="frames-exit" class="composer-frames-exit" type="button" aria-label="Thoát chế độ Frames" title="Quay lại chế độ Text">×</button>
+          </div>
+          <div class="composer-frames-slots">
+            <div class="frame-slot" id="frame-slot-start" data-slot="start">
+              <button class="frame-slot-trigger" type="button" aria-haspopup="dialog" aria-expanded="false">
+                <span class="frame-slot-thumb" aria-hidden="true">
+                  <svg class="frame-slot-plus" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+                  <img alt="" hidden>
+                </span>
+                <span class="frame-slot-meta">
+                  <span class="frame-slot-title">Start frame</span>
+                  <span class="frame-slot-sub">Chọn hoặc tải ảnh</span>
+                </span>
+              </button>
+              <button class="frame-slot-clear" type="button" aria-label="Bỏ Start frame" title="Bỏ Start frame" hidden>×</button>
+            </div>
+            <button id="frames-swap" class="frame-swap-btn" type="button" aria-label="Đổi chỗ Start frame và End frame" title="Đổi chỗ Start ↔ End frame" disabled>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m7 16-4-4 4-4"/><path d="M3 12h18"/><path d="m17 8 4 4-4 4"/></svg>
+            </button>
+            <div class="frame-slot" id="frame-slot-end" data-slot="end">
+              <button class="frame-slot-trigger" type="button" aria-haspopup="dialog" aria-expanded="false">
+                <span class="frame-slot-thumb" aria-hidden="true">
+                  <svg class="frame-slot-plus" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+                  <img alt="" hidden>
+                </span>
+                <span class="frame-slot-meta">
+                  <span class="frame-slot-title">End frame <span class="frame-slot-opt">(tuỳ chọn)</span></span>
+                  <span class="frame-slot-sub">Chọn hoặc tải ảnh</span>
+                </span>
+              </button>
+              <button class="frame-slot-clear" type="button" aria-label="Bỏ End frame" title="Bỏ End frame" hidden>×</button>
+            </div>
+          </div>
+          <div id="frame-picker" class="frame-picker" role="dialog" aria-label="Chọn ảnh cho frame" hidden>
+            <div class="frame-picker-head">
+              <span id="frame-picker-title" class="frame-picker-title">Chọn Start frame</span>
+              <div class="frame-picker-actions">
+                <label class="frame-picker-upload">
+                  Tải ảnh lên
+                  <input id="frame-upload-input" type="file" accept="image/*" hidden>
+                </label>
+                <button id="frame-picker-close" class="frame-picker-close" type="button" aria-label="Đóng">×</button>
+              </div>
+            </div>
+            <div id="frame-picker-grid" class="frame-picker-grid"></div>
+            <p id="frame-picker-empty" class="frame-picker-empty" hidden>Chưa có ảnh trong dự án — bấm “Tải ảnh lên” hoặc tạo ảnh trước.</p>
+          </div>
+        </div>
         <label class="sr-only" for="prompt">Nội dung chat</label>
         <textarea id="prompt" rows="1" placeholder="What do you want to create?"></textarea>
         <div class="composer-bar">
+          <label class="ref-upload-btn" id="ref-upload-btn" title="Thêm tệp ảnh làm tham chiếu (chỉ lưu trên Playground, không tải lên Flow)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+            <span class="ref-upload-label">Thêm tệp</span>
+            <input id="ref-upload-input" type="file" accept="image/*" multiple hidden>
+          </label>
           <button id="gen-trigger" class="gen-trigger" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="gen-dialog" title="Tuỳ chọn tạo">
             <svg id="gen-icon-image" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2.5"/><circle cx="9" cy="9.5" r="1.7"/><path d="m4.5 17.5 4.6-4.6a1.4 1.4 0 0 1 2 0l2.4 2.4 2.1-2.1a1.4 1.4 0 0 1 2 0l2 2"/></svg>
             <svg id="gen-icon-video" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden><rect x="2.5" y="5.5" width="13" height="13" rx="2.5"/><path d="m15.5 10.5 4.4-2.9a1 1 0 0 1 1.6.9v6.9a1 1 0 0 1-1.6.9l-4.4-2.9"/></svg>

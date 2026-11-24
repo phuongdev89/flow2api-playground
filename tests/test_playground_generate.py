@@ -17,6 +17,10 @@ async def _fake_validate(key):
     return key == "test-key"
 
 
+async def _fake_fetch_models(key):
+    return None
+
+
 @pytest.fixture
 def playground_client(tmp_path, monkeypatch):
     database = PlaygroundDatabase(str(tmp_path / "playground.db"))
@@ -24,6 +28,9 @@ def playground_client(tmp_path, monkeypatch):
     monkeypatch.setattr("app.routes.playground_db", database)
     monkeypatch.setattr(
         "app.generation.flow_client.validate_key", _fake_validate
+    )
+    monkeypatch.setattr(
+        "app.generation.flow_client.fetch_models", _fake_fetch_models
     )
     # Job nền gọi generation.run_playground_generate_job(playground_db, ...) —
     # truyền DB qua tham số nên mock validate_key đủ cho login; generation call
