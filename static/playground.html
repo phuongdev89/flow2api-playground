@@ -12,23 +12,25 @@
   <header class="topbar">
     <div class="brand"><span class="brand-mark" aria-hidden="true">F</span><span>Flow2API<span class="brand-divider" aria-hidden="true">/</span>Playground</span></div>
     <div class="topbar-tools">
-      <div class="density-picker" role="group" aria-label="Số card mỗi hàng">
+      <div class="density-picker" role="group" aria-label="Số card mỗi hàng" hidden>
         <button class="density-option" type="button" data-columns="6">Large</button>
         <button class="density-option is-selected" type="button" data-columns="10" aria-pressed="true">Medium</button>
         <button class="density-option" type="button" data-columns="16">Small</button>
       </div>
       <button id="wm-settings" class="logout" type="button" hidden>Mask WM</button>
-      <button id="logout" class="logout" type="button" hidden>Đăng xuất</button>
+      <button id="logout" class="logout" type="button" hidden>Sign out</button>
     </div>
   </header>
 
   <main id="login" class="login">
     <form id="login-form" method="post" autocomplete="off" aria-labelledby="login-title">
-      <h1 id="login-title">Đăng nhập</h1>
+      <h1 id="login-title">Sign in</h1>
+      <label for="api-url">API URL</label>
+      <input id="api-url" type="url" inputmode="url" placeholder="http://your-flow2api-host:port" autocomplete="off" autocapitalize="off" spellcheck="false" required>
       <label for="api-key">API key</label>
-      <input id="api-key" type="password" placeholder="Nhập API key" autocomplete="off" autocapitalize="off" spellcheck="false" required>
+      <input id="api-key" type="password" placeholder="Enter API key" autocomplete="off" autocapitalize="off" spellcheck="false" required>
       <p id="login-error" class="login-error" role="alert" hidden></p>
-      <button id="login-button" class="primary" type="submit">Vào Playground</button>
+      <button id="login-button" class="primary" type="submit">Sign in</button>
     </form>
   </main>
 
@@ -51,8 +53,18 @@
       <p id="results-empty" class="results-empty" hidden>Chưa có kết quả — mô tả ý tưởng bên dưới để bắt đầu.</p>
     </section>
 
+    <div id="selection-toolbar" class="selection-toolbar" role="toolbar" aria-label="Thao tác với item đã chọn" hidden>
+      <span id="selection-count" class="selection-count" aria-live="polite"></span>
+      <button id="selection-clear" class="paint-btn" type="button">Bỏ chọn</button>
+      <button id="selection-delete" class="paint-btn is-danger" type="button">Delete</button>
+    </div>
+
     <div class="composer-dock">
       <div class="composer">
+        <div id="extend-chip" class="extend-chip" hidden>
+          <span id="extend-chip-label"></span>
+          <button id="extend-chip-cancel" class="extend-chip-cancel" type="button" aria-label="Hủy nối tiếp — quay lại chế độ tạo tự do">×</button>
+        </div>
         <div id="composer-refs" class="composer-refs" hidden></div>
         <label class="sr-only" for="prompt">Nội dung chat</label>
         <textarea id="prompt" rows="1" placeholder="What do you want to create?"></textarea>
@@ -116,22 +128,6 @@
     </div>
   </main>
 
-  <div id="paint-editor" class="paint-editor" role="dialog" aria-modal="true" aria-label="Bôi vùng làm tham chiếu" hidden>
-    <div class="paint-panel">
-      <div class="paint-head">
-        <span class="paint-title">Bôi vùng cần dùng làm tham chiếu</span>
-        <div class="paint-tools">
-          <label class="paint-brush-size" for="paint-brush">Cọ</label>
-          <input id="paint-brush" type="range" min="8" max="64" step="4" value="28" aria-label="Kích thước cọ">
-          <button id="paint-reset" class="paint-btn" type="button">Đặt lại</button>
-          <button id="paint-cancel" class="paint-btn" type="button">Hủy</button>
-          <button id="paint-save" class="paint-btn is-primary" type="button" disabled>Lưu tham chiếu</button>
-        </div>
-      </div>
-      <div class="paint-stage"><canvas id="paint-canvas" aria-label="Vùng bôi trên ảnh"></canvas></div>
-    </div>
-  </div>
-
   <div id="item-dialog" class="item-dialog" role="dialog" aria-modal="true" aria-labelledby="item-dialog-title" hidden>
     <form id="item-dialog-form" class="item-dialog-card">
       <h2 id="item-dialog-title">Đổi tên</h2>
@@ -150,6 +146,7 @@
       <div class="paint-head">
         <span class="paint-title" id="mask-editor-title">Tô vùng watermark cần xoá</span>
         <div class="paint-tools">
+          <button id="mask-sample-gen" class="paint-btn" type="button" title="Tạo 1 ảnh ví dụ có watermark làm nền vẽ mask — ảnh được lưu lại cho các lần mở sau">Gen 1 ảnh ví dụ</button>
           <label class="paint-brush-size" for="mask-brush">Cọ</label>
           <input id="mask-brush" type="range" min="8" max="64" step="4" value="28" aria-label="Kích thước cọ">
           <button id="mask-reset" class="paint-btn" type="button">Đặt lại</button>
@@ -157,35 +154,69 @@
           <button id="mask-save" class="paint-btn is-primary" type="button" disabled>Lưu mask</button>
         </div>
       </div>
-      <div class="paint-stage"><canvas id="mask-canvas" aria-label="Vùng tô mask watermark"></canvas></div>
-      <p class="paint-hint">Mask lưu theo model + tỉ lệ khung hình của ảnh này; áp dụng cho các lần tạo sau (tự scale theo kích thước ảnh).</p>
+      <div class="paint-stage">
+        <div class="mask-stage-wrap">
+          <button id="mask-prev" class="mask-nav" type="button" aria-label="Ảnh tham khảo trước (mới hơn)" title="Ảnh mới hơn trong nhóm" hidden>◀</button>
+          <div class="mask-canvas-box">
+            <img id="mask-underlay" class="mask-underlay" alt="" hidden>
+            <canvas id="mask-canvas" aria-label="Vùng tô mask watermark"></canvas>
+            <p id="mask-empty-hint" class="mask-empty-hint" hidden>Chưa có nền để vẽ — bấm “Gen 1 ảnh ví dụ” để tạo ảnh mẫu có watermark.</p>
+          </div>
+          <button id="mask-next" class="mask-nav" type="button" aria-label="Ảnh tham khảo tiếp (cũ hơn)" title="Ảnh cũ hơn trong nhóm" hidden>▶</button>
+        </div>
+        <p id="mask-nav-label" class="mask-nav-label" hidden></p>
+      </div>
+      <p class="paint-hint">Mask lưu theo model + tỉ lệ + độ phân giải (1K/2K có WM ở chỗ khác nhau) của key đang vẽ; áp dụng cho các lần tạo sau với đúng combo đó (tự scale theo kích thước ảnh). Cần nền có watermark mới vẽ được: ảnh ví dụ (nút “Gen 1 ảnh ví dụ” — gen đúng res của key) luôn đứng đầu, ◀ ▶ duyệt thêm ảnh cùng model + tỉ lệ + res trong project. Mask đã lưu hiện lại khi mở editor — vẽ thêm là nối vào mask cũ, “Đặt lại” xoá cả mask cũ để vẽ mới; mask xuất ra luôn nền đen nét trắng.</p>
     </div>
   </div>
 
-  <div id="wm-modal" class="item-dialog" role="dialog" aria-modal="true" aria-label="Mask watermark" hidden>
-    <div class="item-dialog-card wm-card">
-      <h2>Mask xoá watermark</h2>
-      <p id="wm-engine" class="wm-engine"></p>
-      <p class="wm-hint">Bôi chọn ảnh trong stage → menu ⋯ trên một ảnh kết quả → “Tạo mask WM từ ảnh này” để tạo mask cho model + tỉ lệ đó.</p>
-      <ul id="wm-mask-list" class="wm-mask-list" aria-label="Danh sách mask"></ul>
+  <div id="wm-modal" class="item-dialog" role="dialog" aria-modal="true" aria-labelledby="wm-panel-title" hidden>
+    <div class="item-dialog-card wm-panel-card">
+      <div class="wm-panel-head">
+        <h2 id="wm-panel-title">Mask xoá watermark</h2>
+        <span id="wm-engine" class="wm-engine"></span>
+      </div>
+      <p class="wm-hint">Mask ghi nhớ vùng watermark theo <strong>model + tỉ lệ khung hình + độ phân giải</strong> — 1K và 2K có WM ở chỗ khác nhau nên mỗi res là một dòng riêng, không dùng chung mask. Lưu mask một lần cho mỗi combo — các lần tạo sau với đúng combo đó sẽ tự xoá WM (mask tự scale theo kích thước ảnh). Bấm “Vẽ mask” ở một dòng bên dưới — trong editor cần nền có watermark mới tô được: chưa có thì bấm “Gen 1 ảnh ví dụ” (ảnh giữ nguyên WM, gen đúng res, và được lưu cho lần sau).</p>
+      <label class="wm-filter">
+        <input id="wm-filter-active" type="checkbox" checked>
+        Chỉ hiện model đang chọn
+      </label>
+      <div id="wm-mask-grid" class="wm-mask-grid" role="list" aria-label="Mask theo model và tỉ lệ khung hình"></div>
+      <details id="wm-other" class="wm-other" hidden>
+        <summary>Mask khác trên máy (<span id="wm-other-count">0</span>)</summary>
+        <ul id="wm-other-list" class="wm-mask-list" aria-label="Mask không thuộc model/tỉ lệ nào"></ul>
+      </details>
       <div class="item-dialog-actions">
-        <button id="wm-close" class="paint-btn is-primary" type="button">Đóng</button>
+        <button id="wm-close" class="paint-btn" type="button">Đóng</button>
       </div>
     </div>
   </div>
 
-  <div id="extend-dialog" class="item-dialog" role="dialog" aria-modal="true" aria-labelledby="extend-title" hidden>
-    <form id="extend-form" class="item-dialog-card wm-card">
-      <h2 id="extend-title">Nối tiếp video này</h2>
-      <p class="wm-hint">Video gốc giữ nguyên — tạo đoạn tiếp theo dựa trên nội dung nó (giống Extend trong Flow). Video mới sẽ xuất hiện như một item riêng.</p>
-      <label class="sr-only" for="extend-prompt">Prompt đoạn tiếp theo</label>
-      <textarea id="extend-prompt" rows="3" maxlength="2000" placeholder="Mô tả đoạn tiếp theo của video…" autocomplete="off"></textarea>
-      <p id="extend-error" class="item-dialog-error" role="alert" hidden></p>
-      <div class="item-dialog-actions">
-        <button id="extend-cancel" class="paint-btn" type="button">Hủy</button>
-        <button id="extend-submit" class="paint-btn is-primary" type="submit">Tạo đoạn tiếp theo</button>
+  <div id="video-editor" class="item-dialog" role="dialog" aria-modal="true" aria-labelledby="video-editor-title" hidden>
+    <div class="video-editor-card">
+      <div class="video-editor-head">
+        <h2 id="video-editor-title" class="video-editor-title">Video</h2>
+        <button id="video-editor-close" class="video-editor-close" type="button" aria-label="Đóng trình chỉnh sửa video">×</button>
       </div>
-    </form>
+      <video id="video-editor-player" class="video-editor-player" controls preload="metadata"></video>
+      <div class="trim-block">
+        <div id="trim-track" class="trim-track">
+          <div class="trim-rail" aria-hidden="true"></div>
+          <div id="trim-range" class="trim-range" aria-hidden="true"></div>
+          <button id="trim-handle-start" class="trim-handle" type="button" aria-label="Điểm bắt đầu đoạn giữ lại" disabled></button>
+          <button id="trim-handle-end" class="trim-handle" type="button" aria-label="Điểm kết thúc đoạn giữ lại" disabled></button>
+        </div>
+        <p id="trim-times" class="trim-times">
+          <span id="trim-start-label">0:00</span>
+          <span id="trim-duration-label">–:––</span>
+          <span id="trim-end-label">0:00</span>
+        </p>
+      </div>
+      <div class="item-dialog-actions video-editor-actions">
+        <button id="video-editor-extend" class="paint-btn" type="button" title="Tạo video nối tiếp từ video này">Extend</button>
+        <button id="video-editor-trim-save" class="paint-btn is-primary" type="button">Cắt &amp; Lưu</button>
+      </div>
+    </div>
   </div>
 </body>
 </html>

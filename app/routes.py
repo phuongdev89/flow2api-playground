@@ -1,8 +1,9 @@
 """Playground API routes — copy từ block playground của flow2api src/main.py.
 
 Điểm khác chính sau khi tách project:
-- Login session xác thực key qua flow2api (GET /v1/models) thay vì AuthManager
-  nội bộ; key được lưu vào row session để job nền dùng gọi generation.
+- Login session xác thực cặp (api_url, api_key) qua GET /v1/models trên
+  endpoint user nhập; cả hai được lưu vào row session để job nền dùng gọi
+  generation đúng endpoint đã đăng nhập.
 - Thêm nhóm endpoint /playground/api/watermark quản mask (thay tab 水印 Mask
   trong admin console của flow2api cũ).
 """
@@ -10,10 +11,12 @@
 import base64
 import hashlib
 import logging
+import math
 import re
 import secrets
 import time
 import uuid
+from urllib.parse import urlsplit
 
 from fastapi import (
     APIRouter,
@@ -52,6 +55,34 @@ _NO_STORE_HEADERS = {
 }
 
 optional_security = HTTPBearer(auto_error=False)
+
+
+class PlaygroundSessionRequest(BaseModel):
+    """Login từ form: endpoint + key đều do user nhập (đúng cả hai mới vào được)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    api_url: str | None = Field(default=None, max_length=2000)
+    api_key: str | None = Field(default=None, min_length=1, max_length=500)
+
+
+def _normalize_flow_url(raw: str | None) -> str | None:
+    """Chuẩn hoá endpoint user nhập; sai format thì 422 để form báo lỗi ngay.
+
+    None = không gửi URL (script/curl cũ) → fallback endpoint theo env config.
+    Còn gửi mà rỗng/sai scheme thì chặn — form yêu cầu cả hai ô mới vào được.
+    """
+    if raw is None:
+        return None
+    url = raw.strip().rstrip("/")
+    parsed = urlsplit(url)
+    if not url or parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid API URL — use an http:// or https:// endpoint.",
+            headers=_NO_STORE_HEADERS,
+        )
+    return url
 
 
 class PlaygroundProjectCreate(BaseModel):
@@ -104,11 +135,30 @@ class PlaygroundItemUpdateRequest(BaseModel):
     image: str | None = None
 
 
+class PlaygroundTrimRequest(BaseModel):
+    # extra="ignore" theo pattern PlaygroundGenerateRequest.
+    model_config = ConfigDict(extra="ignore")
+
+    # Cắt giữ lại đoạn [start_sec, end_sec) của item video (giây).
+    start_sec: float
+    end_sec: float
+
+
 class PlaygroundMaskSaveRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     # Data URL PNG từ canvas tô mask trong modal settings.
     image: str = Field(min_length=1, max_length=20_000_000)
+
+
+class PlaygroundSampleRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    # Model image + tỉ lệ + res để tạo 1 ảnh ví dụ (nền vẽ mask WM, giữ nguyên
+    # watermark). WM layout khác nhau theo res nên sample gen đúng res của key.
+    model: str = Field(min_length=1, max_length=200)
+    ratio: str = Field(min_length=1, max_length=20)
+    res: str | None = Field(default=None, max_length=20)
 
 
 def _no_store(response: Response) -> Response:
@@ -150,8 +200,6 @@ async def _require_playground_mutation(
         )
     origin = request.headers.get("origin")
     if origin:
-        from urllib.parse import urlsplit
-
         parsed = urlsplit(origin)
         if parsed.scheme != request.url.scheme or parsed.netloc.lower() != request.url.netloc.lower():
             raise HTTPException(
@@ -196,32 +244,53 @@ async def playground_script():
 async def playground_session(
     response: Response,
     request: Request,
+    payload: PlaygroundSessionRequest | None = None,
     credentials: HTTPAuthorizationCredentials | None = Security(optional_security),
     playground_session: str | None = Cookie(default=None, alias=PLAYGROUND_SESSION_COOKIE),
 ):
     owner_hash = None
     if playground_session:
         owner_hash = await playground_db.owner_for_session(_cookie_hash(playground_session))
-    if request.method == "POST" and owner_hash is None and credentials is not None:
-        api_key = credentials.credentials
-        # Key xác thực trực tiếp với flow2api — playground không giữ danh sách
-        # key riêng. Key hợp lệ được lưu vào session để job nền gọi generation.
-        if await generation.flow_client.validate_key(api_key):
-            owner_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
-            raw_token = secrets.token_urlsafe(48)
-            await playground_db.create_session(
-                _cookie_hash(raw_token), owner_hash, int(time.time()) + PLAYGROUND_SESSION_TTL,
-                api_key=api_key,
-            )
-            response.set_cookie(
-                PLAYGROUND_SESSION_COOKIE,
-                raw_token,
-                max_age=PLAYGROUND_SESSION_TTL,
-                httponly=True,
-                samesite="lax",
-                secure=request.url.scheme == "https",
-                path="/playground",
-            )
+    if request.method == "POST" and owner_hash is None:
+        # Ưu tiên JSON body từ form (api_url + api_key); Bearer header giữ lại
+        # cho script/curl. Không có api_url → endpoint mặc định theo env config.
+        api_key = (payload.api_key if payload else None) or (
+            credentials.credentials if credentials else None
+        )
+        api_url = _normalize_flow_url(payload.api_url if payload else None)
+        if api_key:
+            client = generation.get_flow_client(api_url)
+            # Key xác thực trực tiếp với endpoint đã nhập — sai URL hoặc sai key
+            # đều không cấp session. Lỗi được phân loại để form báo đúng chỗ sửa.
+            if await client.validate_key(api_key):
+                owner_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+                raw_token = secrets.token_urlsafe(48)
+                await playground_db.create_session(
+                    _cookie_hash(raw_token), owner_hash, int(time.time()) + PLAYGROUND_SESSION_TTL,
+                    api_key=api_key,
+                    api_url=api_url,
+                )
+                response.set_cookie(
+                    PLAYGROUND_SESSION_COOKIE,
+                    raw_token,
+                    max_age=PLAYGROUND_SESSION_TTL,
+                    httponly=True,
+                    samesite="lax",
+                    secure=request.url.scheme == "https",
+                    path="/playground",
+                )
+            elif client.last_check_error == "unreachable":
+                raise HTTPException(
+                    status_code=502,
+                    detail="Could not connect to the API URL — check the endpoint address.",
+                    headers=_NO_STORE_HEADERS,
+                )
+            else:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Invalid API key for this endpoint.",
+                    headers={**_NO_STORE_HEADERS, "WWW-Authenticate": "Bearer"},
+                )
     if owner_hash is None:
         raise HTTPException(
             status_code=401,
@@ -384,7 +453,7 @@ async def playground_generate(
         # Video extend từ nguồn lite: đoạn mới vẫn có WM viền → crop giống lite.
         params["crop_like_lite"] = "lite" in str((source.get("meta") or {}).get("model", ""))
 
-    api_key = await playground_db.api_key_for_owner(owner_hash)
+    api_key, api_url = await playground_db.api_credentials_for_owner(owner_hash)
     if not api_key:
         raise HTTPException(
             status_code=401,
@@ -395,7 +464,7 @@ async def playground_generate(
     job = await playground_db.create_job(str(uuid.uuid4()), owner_hash, project_id)
     generation.spawn_job(
         generation.run_playground_generate_job(
-            playground_db, owner_hash, project_id, job["job_id"], params, api_key
+            playground_db, owner_hash, project_id, job["job_id"], params, api_key, api_url
         )
     )
     return _response({"job_id": job["job_id"]}, status_code=202)
@@ -414,6 +483,23 @@ async def playground_generate_status(
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return _response(job)
+
+
+@router.get("/playground/api/projects/{project_id}/jobs", include_in_schema=False)
+async def playground_project_jobs(
+    project_id: str,
+    owner_hash: str = Security(_require_playground_owner),
+):
+    """Danh sách job gần nhất của project (mới nhất trước, tối đa 20) — frontend
+    gọi sau F5 để khôi phục queue.
+
+    GET chỉ cần session owner (không cần marker same-origin). Project không còn
+    hoặc chưa có job nào → trả danh sách rỗng (không 404) để client xử lý một
+    nhánh duy nhất. Owner khác không bao giờ thấy job của nhau vì query lọc
+    theo owner_hash của session.
+    """
+    jobs = await playground_db.list_jobs_for_project(owner_hash, project_id)
+    return _response({"jobs": jobs})
 
 
 # ── Playground items (results / ảnh tham chiếu) ──────────────────────────
@@ -575,6 +661,77 @@ async def playground_delete_item(
     return _no_store(Response(status_code=204))
 
 
+@router.post(
+    "/playground/api/projects/{project_id}/items/{item_id}/trim",
+    status_code=201,
+    include_in_schema=False,
+)
+async def playground_trim_item(
+    project_id: str,
+    item_id: str,
+    payload: PlaygroundTrimRequest,
+    request: Request,
+    owner_hash: str = Security(_require_playground_owner),
+):
+    """Cắt giữ lại đoạn [start_sec, end_sec) của item video → item mới.
+
+    File và item gốc giữ nguyên; bản trim là mp4 mới trong RESULTS_DIR, không
+    mang media_generation_id (không tồn tại trên Flow nên không extend được).
+    """
+    await _require_playground_mutation(request, request.headers.get("x-playground-request"))
+    project = await _load_owned_project_or_404(owner_hash, project_id)
+    source = next(
+        (
+            item
+            for item in project.get("results") or []
+            if isinstance(item, dict) and str(item.get("id")) == item_id
+        ),
+        None,
+    )
+    if source is None:
+        raise HTTPException(status_code=404, detail="Item not found")
+    if source.get("kind") != "video":
+        raise HTTPException(status_code=400, detail="Chỉ cắt được item video.")
+
+    start, end = float(payload.start_sec), float(payload.end_sec)
+    if not (math.isfinite(start) and math.isfinite(end)):
+        raise HTTPException(status_code=400, detail="Thời gian cắt phải là số hợp lệ.")
+    if start < 0 or end <= start:
+        raise HTTPException(
+            status_code=400, detail="Khoảng cắt không hợp lệ — cần 0 ≤ start < end."
+        )
+    length = end - start
+    if length < generation.TRIM_MIN_DURATION_SEC:
+        raise HTTPException(
+            status_code=400, detail="Đoạn cắt quá ngắn — tối thiểu 0.2 giây."
+        )
+    if length > generation.TRIM_MAX_DURATION_SEC:
+        raise HTTPException(
+            status_code=400, detail="Đoạn cắt quá dài — tối đa 120 giây."
+        )
+
+    try:
+        item = await generation.trim_playground_video_item(source, start, end)
+    except ValueError as exc:
+        # Path lạ / file mất / end vượt độ dài — message tự viết, không lộ path.
+        raise HTTPException(status_code=400, detail=str(exc))
+    except generation.TrimVideoError as exc:
+        # Chi tiết ffmpeg/subprocess chỉ log server-side (chứa path hệ thống).
+        logger.warning("[TRIM] %s/%s thất bại: %s", project_id, item_id, exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Không cắt được video — ffmpeg lỗi hoặc định dạng không hỗ trợ.",
+        )
+
+    # Tên item mới: "{tên gốc} (trim)", dedupe bằng helper dùng chung của generation.
+    original_name = str(source.get("name") or "").strip()
+    base_name = f"{original_name} (trim)" if original_name else "Video (trim)"
+    generation._assign_generated_item_names(project, [item], None, base_name=base_name)
+    if await playground_db.append_results(owner_hash, project_id, [item]) is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return _response(item, status_code=201)
+
+
 # ── Watermark mask management (thay tab 水印 Mask admin console cũ) ──────
 
 
@@ -587,6 +744,19 @@ async def playground_watermark_info(owner_hash: str = Security(_require_playgrou
             "masks": watermark.list_saved_masks(),
         }
     )
+
+
+@router.get("/playground/api/watermark/mask/{mask_key}", include_in_schema=False)
+async def playground_get_mask(
+    mask_key: str,
+    owner_hash: str = Security(_require_playground_owner),
+):
+    # Exact key (frontend gọi với key đã sanitize) — mask active qua fallback
+    # chain là chuyện của remove_watermark, editor chỉ nạp mask của chính key đó.
+    raw = watermark.read_mask_file_bytes(mask_key)
+    if raw is None:
+        raise HTTPException(status_code=404, detail="Mask not found")
+    return Response(content=raw, media_type="image/png", headers=_NO_STORE_HEADERS)
 
 
 @router.post("/playground/api/watermark/mask/{mask_key}", include_in_schema=False)
@@ -620,3 +790,56 @@ async def playground_delete_mask(
         raise HTTPException(status_code=404, detail="Mask not found")
     response.status_code = 204
     return _no_store(response)
+
+
+# Owner đang chạy generate_watermark_sample — chặn double-click/spam sample
+# (mỗi lần gọi tốn một lượt generation thật phía upstream).
+_sample_generating: set[str] = set()
+
+_MIME_BY_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".bmp": "image/bmp"}
+
+
+@router.get("/playground/api/watermark/sample/{mask_key}", include_in_schema=False)
+async def playground_get_sample(
+    mask_key: str,
+    owner_hash: str = Security(_require_playground_owner),
+):
+    found = watermark.read_sample_for_key(mask_key)
+    if found is None:
+        raise HTTPException(status_code=404, detail="Sample not found")
+    raw, ext = found
+    return Response(content=raw, media_type=_MIME_BY_EXT.get(ext, "image/png"), headers=_NO_STORE_HEADERS)
+
+
+@router.post("/playground/api/watermark/sample", include_in_schema=False)
+async def playground_create_sample(
+    payload: PlaygroundSampleRequest,
+    request: Request,
+    owner_hash: str = Security(_require_playground_owner),
+):
+    await _require_playground_mutation(request, request.headers.get("x-playground-request"))
+    api_key, api_url = await playground_db.api_credentials_for_owner(owner_hash)
+    if not api_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Phiên hết hạn key flow2api — vui lòng đăng nhập lại.",
+            headers=_NO_STORE_HEADERS,
+        )
+    if owner_hash in _sample_generating:
+        raise HTTPException(
+            status_code=429,
+            detail="Đang tạo ảnh ví dụ — vui lòng đợi lần tạo hiện tại xong.",
+            headers=_NO_STORE_HEADERS,
+        )
+    _sample_generating.add(owner_hash)
+    try:
+        info = await generation.generate_watermark_sample(
+            payload.model, payload.ratio, payload.res or "1K", api_key, api_url
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=f"Không tạo được ảnh ví dụ: {exc}")
+    finally:
+        _sample_generating.discard(owner_hash)
+    return _response(info)

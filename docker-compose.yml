@@ -15,6 +15,9 @@ services:
       WATERMARK_ENGINE: ${WATERMARK_ENGINE:-auto}
       WATERMARK_VIDEO_CROP_PERCENT: ${WATERMARK_VIDEO_CROP_PERCENT:-2}
       PLAYGROUND_MAX_RUNNING_JOBS: ${PLAYGROUND_MAX_RUNNING_JOBS:-3}
+      # Reload code: uvicorn tự restart worker khi app/*.py đổi — sửa code xong
+      # không cần docker restart. Đặt PLAYGROUND_RELOAD=0 trong .env để tắt.
+      PLAYGROUND_RELOAD: ${PLAYGROUND_RELOAD:-1}
       TORCH_HUB_CACHE: /root/.cache/torch/hub
     volumes:
       - ./data:/app/data

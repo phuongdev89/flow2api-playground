@@ -247,6 +247,7 @@ h1 { min-width: 0; overflow-wrap: anywhere; font-weight: 640; }
 }
 .gen-dialog[data-state="loading"] { pointer-events: none; }
 .gen-dialog[data-state="loading"] :is(.gen-tab, .gen-seg-btn, .gen-qty-btn, .gen-ratio, .gen-model, .gen-length, .gen-ratios) { opacity: .55; }
+.gen-body > div { margin: 5px 0; }
 .gen-dialog :is(.gen-tab, .gen-seg-btn, .gen-qty-btn, .gen-ratio, .gen-model, .gen-model-option), .gen-model-chevron {
   transition: background-color 120ms var(--ease-out), color 120ms var(--ease-out), transform 120ms var(--ease-out);
 }
@@ -490,25 +491,60 @@ h1 { min-width: 0; overflow-wrap: anywhere; font-weight: 640; }
 @keyframes result-shimmer { to { transform: translateX(100%); } }
 @keyframes result-spin { to { transform: rotate(1turn); } }
 
-/* Lightbox overlay for result cards; sits above the composer and its dialog. */
+/* ── Hover overlay trên card: chỉ tên item (hành động dồn vào menu ⋯) ────── */
+.result-overlay {
+  position: absolute;
+  inset: auto 0 0 0;
+  z-index: 2;
+  display: grid;
+  gap: 4px;
+  justify-items: start;
+  padding: 18px 8px 6px;
+  background: linear-gradient(#0000, #000000c9 72%);
+  opacity: 0;
+  /* pointer-events none: click "xuyên" overlay vẫn mở lightbox như click ảnh. */
+  pointer-events: none;
+  transition: opacity .12s ease;
+}
+.result-card:hover .result-overlay,
+.result-overlay:focus-within { opacity: 1; }
+/* Ellipsis chuẩn: tên dài (server đặt ≤20 ký tự hoặc user tự đặt) không phá
+   layout card. Video chừa 36px cho nút expand cùng hàng; ảnh dùng hết chiều rộng. */
+.result-name {
+  max-width: calc(100% - 36px);
+  overflow: hidden;
+  color: #f1f1f1;
+  font-size: 10.5px;
+  font-weight: 550;
+  line-height: 1.35;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.result-card.is-image .result-name { max-width: 100%; }
+@media (prefers-reduced-motion: reduce) {
+  .result-overlay { transition: none; }
+}
+
+/* Lightbox overlay for result cards; sits above the composer and its dialog.
+   Gallery layout: media giữa, header tên + chất lượng trên đầu, ‹ › hai biên. */
 .lightbox {
   position: fixed;
   inset: 0;
   z-index: 20;
-  display: grid;
-  place-items: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   padding: clamp(16px, 4vw, 48px);
   background: #000000eb;
   animation: lightbox-in 140ms var(--ease-out);
 }
 @keyframes lightbox-in { from { opacity: 0; } }
-.lightbox-img, .lightbox-video {
+.lightbox-img {
   max-width: 100%;
   max-height: calc(100dvh - clamp(32px, 8vw, 96px));
   border-radius: 12px;
   background: var(--black);
 }
-.lightbox-video { width: min(100%, 1100px); }
 .lightbox-close {
   position: absolute;
   top: 14px;
@@ -525,6 +561,64 @@ h1 { min-width: 0; overflow-wrap: anywhere; font-weight: 640; }
   line-height: 1;
 }
 .lightbox-close:hover { background: var(--hover); }
+
+/* ── Gallery header (tên ảnh + chất lượng + download/đóng) ─────────────────── */
+.lightbox-head {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px clamp(14px, 3vw, 24px);
+  background: linear-gradient(#000000d9, #0000);
+}
+.lightbox-title {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13.5px;
+  font-weight: 650;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.lightbox-meta { flex: 0 0 auto; color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+.lightbox-head .lightbox-close { position: static; flex: 0 0 auto; }
+.lightbox-btn {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  min-height: 38px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--paper);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.lightbox-btn:hover { background: var(--hover); }
+.lightbox-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: #000000b8;
+  color: var(--text);
+  font-size: 20px;
+  line-height: 1;
+}
+.lightbox-nav:hover { background: var(--hover); }
+.lightbox-nav:disabled { opacity: .3; cursor: default; }
+.lightbox-prev { left: clamp(10px, 2vw, 24px); }
+.lightbox-next { right: clamp(10px, 2vw, 24px); }
 
 /* Pills the selected model does not support (aria-disabled, click skipped in JS).
    One shared disabled treatment across the dialog: dimmed, not-allowed, tooltip via title. */
@@ -703,7 +797,61 @@ h1 { min-width: 0; overflow-wrap: anywhere; font-weight: 640; }
   border-radius: 10px;
   background: #0a0a0a;
 }
-#paint-canvas, #mask-canvas { max-width: 100%; max-height: calc(100dvh - 190px); cursor: crosshair; touch-action: none; }
+#mask-canvas { position: relative; z-index: 1; max-width: 100%; max-height: calc(100dvh - 190px); cursor: crosshair; touch-action: none; }
+/* Chưa có nền (ảnh ví dụ/ảnh tham khảo) → không cho tô mù trên nền đen. */
+#mask-canvas.is-idle { cursor: not-allowed; }
+.mask-empty-hint {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  margin: 0;
+  padding: 18px;
+  font-size: 12.5px;
+  color: var(--muted);
+  text-align: center;
+  pointer-events: none;
+}
+#mask-sample-gen { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+#mask-sample-gen:disabled { opacity: .5; cursor: default; }
+
+/* ── Mask editor: duyệt ảnh tham khảo (underlay dưới canvas) ──────────────── */
+.mask-stage-wrap { display: flex; align-items: center; justify-content: center; gap: 6px; min-width: 0; }
+.mask-canvas-box {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  /* Nền đen do box đảm nhiệm — canvas trong suốt chỉ vẽ nét trắng, nên ảnh mờ
+     ở dưới nhìn xuyên qua được mà không lẫn vào bitmap mask khi export. */
+  background: #000;
+}
+.mask-underlay {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  opacity: .35;
+  pointer-events: none;
+}
+.mask-nav {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--gen-border, #2c2c2d);
+  border-radius: 8px;
+  background: var(--gen-surface, #212122);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1;
+}
+.mask-nav:hover { background: var(--gen-surface-2, #2a2a2b); }
+.mask-nav:disabled { opacity: .35; cursor: default; }
+.mask-nav-label { margin: 6px 2px 0; font-size: 11px; color: var(--muted); text-align: center; }
 
 /* ── Item dialog (rename / confirm) ───────────────────────────────── */
 
@@ -771,6 +919,26 @@ h1 { min-width: 0; overflow-wrap: anywhere; font-weight: 640; }
   font-weight: 700;
   line-height: 1;
 }
+
+/* ── Toolbar khi đang có item được chọn (marquee) ─────────────────────────── */
+.selection-toolbar {
+  position: fixed;
+  /* Căn giữa theo vùng stage (trừ sidebar); --sidebar-offset kế thừa từ .workspace. */
+  top: calc(var(--header-height) + 12px);
+  left: calc(var(--sidebar-offset, 0px) + (100vw - var(--sidebar-offset, 0px)) / 2);
+  transform: translateX(-50%);
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #101010ee;
+  box-shadow: 0 10px 26px #000a;
+}
+.selection-count { font-size: 12px; font-weight: 600; color: var(--text); white-space: nowrap; }
+.selection-toolbar .paint-btn { min-height: 30px; padding: 0 11px; font-size: 12px; }
 
 /* ── Composer refs (thumb tham chiếu trong ô chat) ───────────────────────── */
 
@@ -841,17 +1009,191 @@ h1 { min-width: 0; overflow-wrap: anywhere; font-weight: 640; }
 .wm-mask-delete { padding: 4px 9px; border-radius: 6px; font-size: 11px; color: #ff6b6b; border: 1px solid #3a2424; background: transparent; }
 .wm-mask-delete:hover { background: #ff6b6b22; }
 
-/* ── Extend dialog ────────────────────────────────────────────────────────── */
-#extend-prompt {
-  width: 100%;
-  resize: vertical;
-  min-height: 64px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 9px 10px;
-  background: var(--black);
-  color: var(--text);
-  font-size: 13px;
-  line-height: 1.45;
+/* ── Mask WM panel (quản lý theo model × ratio) ──────────────────────────── */
+.wm-panel-card {
+  width: min(560px, calc(100vw - 32px));
+  max-height: calc(100dvh - 36px);
+  overflow-y: auto;
 }
-#extend-prompt:focus-visible { outline: none; border-color: var(--muted); }
+.wm-panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.wm-panel-head .wm-engine { font-size: 11.5px; }
+.wm-filter { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); }
+.wm-filter input { accent-color: var(--accent); }
+.wm-mask-grid { display: grid; gap: 6px; max-height: 320px; overflow-y: auto; }
+.wm-mask-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--paper);
+}
+.wm-mask-item.has-mask { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+/* Ô trạng thái thay thumbnail: API chưa có endpoint đọc file mask nên chỉ hiển
+   thị đã có (✓ nền accent) / chưa có (khung nét đứt). */
+.wm-mask-status {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  color: var(--accent-ink);
+  font-size: 11px;
+  font-weight: 750;
+}
+.wm-mask-status.is-ok { border-style: solid; border-color: transparent; background: var(--accent); }
+.wm-mask-info { display: grid; flex: 1; min-width: 0; gap: 1px; }
+.wm-mask-name { font-size: 12.5px; font-weight: 600; color: var(--text); }
+.wm-mask-item .wm-mask-key {
+  overflow: hidden;
+  font-size: 10.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.wm-mask-tools { display: flex; flex: 0 0 auto; gap: 6px; }
+.wm-mask-draw {
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--gen-surface, #212122);
+  color: var(--text);
+  font-size: 11.5px;
+}
+.wm-mask-draw:hover { background: var(--gen-surface-2, #2a2a2b); }
+.wm-mask-item .wm-mask-delete { padding: 5px 10px; font-size: 11.5px; }
+.wm-other { display: grid; gap: 8px; }
+.wm-other[hidden] { display: none; }
+.wm-other summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+
+/* ── Video editor modal (trim timeline + extend) ─────────────────────────── */
+.video-editor-card {
+  width: min(720px, 100%);
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--gen-border, #2c2c2d);
+  border-radius: 14px;
+  background: var(--gen-bg, #0e0e0f);
+}
+.video-editor-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.video-editor-title {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 650;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.video-editor-close {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--paper);
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1;
+}
+.video-editor-close:hover { background: var(--hover); }
+.video-editor-player {
+  display: block;
+  width: 100%;
+  max-height: min(58dvh, 560px);
+  border-radius: 10px;
+  background: var(--black);
+}
+.trim-block { display: grid; gap: 8px; }
+.trim-track { position: relative; height: 30px; touch-action: none; }
+.trim-rail {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  right: 0;
+  height: 5px;
+  transform: translateY(-50%);
+  border-radius: 999px;
+  background: #3d3d3e;
+}
+.trim-range {
+  position: absolute;
+  top: 50%;
+  height: 5px;
+  transform: translateY(-50%);
+  border-radius: 999px;
+  background: var(--accent);
+  pointer-events: none;
+}
+.trim-handle {
+  position: absolute;
+  top: 50%;
+  width: 14px;
+  height: 22px;
+  padding: 0;
+  transform: translate(-50%, -50%);
+  border: 1px solid #00000066;
+  border-radius: 5px;
+  background: #ececec;
+  cursor: ew-resize;
+}
+.trim-handle:hover, .trim-handle:focus-visible { background: #fff; }
+.trim-handle:disabled { opacity: .4; cursor: default; }
+.trim-times {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.video-editor-actions { justify-content: space-between; }
+
+/* ── Chip "Nối tiếp" nổi trên composer khi ở chế độ extend ────────────────── */
+.extend-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 2px;
+  padding: 5px 6px 5px 11px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 10%, var(--paper));
+  font-size: 12px;
+}
+.extend-chip-label {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-weight: 600;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.extend-chip-cancel {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid #333;
+  border-radius: 50%;
+  background: #101010;
+  color: #ff6b6b;
+  font-size: 11px;
+  line-height: 1;
+}
+.extend-chip-cancel:hover { background: #ff6b6b; color: #101010; }

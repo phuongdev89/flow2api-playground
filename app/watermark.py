@@ -8,14 +8,19 @@ Model LaMa (big-lama.pt) qua gói simple-lama-inpainting, fallback cv2.inpaint.
 Pixel ngoài mask được ép giữ nguyên 100%.
 
 Mask là **per-key**: đặt tại ``masks/{key}.png`` với key dạng
-``{base_model}:{ratio}`` (vd ``gemini-3.0-pro-image:9:16`` — sanitize thành
-``gemini-3.0-pro-image_9_16.png``), vẽ từ modal Mask WM trong playground.
-Thứ tự fallback khi key không có mask:
-  1. mask legacy của model id đã resolve ({base}-{orient}, {base}-{orient}-{res})
-  2. mask dùng chung ``masks/watermark.png``
+``{base_model}:{ratio}:{res}`` (vd ``gemini-3.0-pro-image:9:16:2k`` — sanitize
+thành ``gemini-3.0-pro-image_9_16_2k.png``), vẽ từ modal Mask WM trong
+playground. WM layout khác nhau theo res (1K ≠ 2K) nên mask tách theo res —
+không dùng chung cho cả ratio. Thứ tự fallback khi key không có mask:
+  1. mask legacy của model id đã resolve ({base}-{orient}-{res}, {base}-{orient};
+     orient đầy đủ theo ASPECT_RATIO_MAP: landscape/square/three-four/four-three/portrait)
+  2. prefix sweep: file cùng prefix ``{key}-*`` — mask cùng nhóm orientation
+     dù lệch suffix res (vd mask ``-portrait-2k`` áp dụng cho generation 1K)
+  3. mask dùng chung ``masks/watermark.png``
 
 Mask được tự resize INTER_NEAREST về đúng kích thước ảnh lúc remove — một mask
-vẽ trên ảnh bất kỳ dùng được cho mọi resolution/aspect cùng nhóm.
+vẽ trên ảnh bất kỳ dùng được cho mọi kích thước trong CÙNG nhóm
+model+ratio+res.
 
 Ngoài ra crop video (ffmpeg) cắt vùng WM viền (veo-3.1-lite): crop đều mỗi
 cạnh một tỷ lệ phần trăm.
@@ -77,6 +82,45 @@ def mask_path_for_key(key: Optional[str]) -> Path:
     return _mask_dir() / f"{sanitize_key(key)}.png"
 
 
+# Ảnh ví dụ ("Gen 1 ảnh ví dụ" trong mask editor) làm nền vẽ mask — giữ nguyên
+# watermark. Prefix sample_ để prefix-sweep của load_mask_for_key và
+# list_saved_masks không bao giờ nhầm file này là mask.
+SAMPLE_PREFIX = "sample_"
+
+
+def sample_path_for_key(key: str, ext: str = ".png") -> Path:
+    """Đường dẫn file ảnh ví dụ của key (chưa chắc tồn tại)."""
+    if not ext.startswith("."):
+        ext = f".{ext}"
+    return _mask_dir() / f"{SAMPLE_PREFIX}{sanitize_key(key)}{ext.lower()}"
+
+
+def save_sample_for_key(key: str, raw: bytes, ext: str = ".png") -> Path:
+    """Lưu ảnh ví dụ NGUYÊN bytes (không chuẩn hoá — cần thấy đúng vị trí WM)."""
+    target = sample_path_for_key(key, ext)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(raw)
+    logger.info("[WATERMARK] Đã lưu ảnh ví dụ cho key %s: %s", key, target.name)
+    return target
+
+
+def read_sample_for_key(key: str) -> Optional[Tuple[bytes, str]]:
+    """Đọc ảnh ví dụ của key → (bytes, ext) hoặc None nếu chưa có."""
+    mask_dir = _mask_dir()
+    if not mask_dir.is_dir():
+        return None
+    # stem qua sanitize_key chỉ còn [A-Za-z0-9._-] — không có ký tự wildcard glob.
+    stem = f"{SAMPLE_PREFIX}{sanitize_key(key)}"
+    for path in sorted(mask_dir.glob(f"{stem}.*")):
+        if not path.is_file() or path.suffix.lower() not in _MASK_EXTENSIONS:
+            continue
+        try:
+            return path.read_bytes(), path.suffix.lower()
+        except OSError as e:
+            logger.warning("[WATERMARK] Không đọc được ảnh ví dụ %s: %s", path.name, e)
+    return None
+
+
 def list_saved_masks() -> List[Dict]:
     """Danh sách mask đang có trong thư mục mask (cho API settings)."""
     mask_dir = _mask_dir()
@@ -84,7 +128,11 @@ def list_saved_masks() -> List[Dict]:
     if not mask_dir.is_dir():
         return result
     for p in sorted(mask_dir.iterdir()):
-        if p.is_file() and p.suffix.lower() in _MASK_EXTENSIONS:
+        if (
+            p.is_file()
+            and p.suffix.lower() in _MASK_EXTENSIONS
+            and not p.name.startswith(SAMPLE_PREFIX)
+        ):
             try:
                 stat = p.stat()
             except OSError:
@@ -187,25 +235,69 @@ def _read_mask_file(mask_path: Path) -> Optional["np.ndarray"]:
 def load_mask_for_key(
     key: Optional[str] = None, fallback_keys: Optional[List[str]] = None
 ) -> Optional["np.ndarray"]:
-    """Mask theo thứ tự: key chính → fallback keys → watermark.png dùng chung."""
+    """Mask theo thứ tự: key chính → fallback keys → prefix cùng nhóm → dùng chung.
+
+    Prefix sweep (bước 3) cho phép mask lưu với suffix res khác vẫn được áp
+    dụng: mask lưu ``{base}-portrait-2k`` dùng được cho generation 1K/không res
+    cùng nhóm portrait (mask tự resize về đúng khung lúc inpaint), nhưng không
+    bao giờ nhảy sang nhóm orientation khác (portrait ≠ landscape ≠ four-three).
+    """
     if cv2 is None or np is None:
         return None
     mask_dir = _mask_dir()
     if not mask_dir.is_dir():
         return None
 
-    candidates: List[Path] = []
-    for candidate_key in ([key, *(fallback_keys or [])] if key is not None else []):
-        if candidate_key:
-            candidates.append(mask_path_for_key(candidate_key))
-    candidates.append(mask_dir / f"{GLOBAL_MASK_STEM}.png")
+    candidate_keys = [
+        candidate_key
+        for candidate_key in ([key, *(fallback_keys or [])] if key is not None else [])
+        if candidate_key
+    ]
 
-    for path in candidates:
+    # 1) Khớp chính xác tên file của từng key, đúng thứ tự ưu tiên.
+    for candidate_key in candidate_keys:
+        path = mask_path_for_key(candidate_key)
         if path.is_file():
             mask = _read_mask_file(path)
             if mask is not None:
                 return mask
+
+    # 2) Prefix sweep: file cùng prefix (cùng base+orientation) dù lệch suffix.
+    seen_prefixes = set()
+    for candidate_key in candidate_keys:
+        prefix = sanitize_key(candidate_key)
+        if not prefix or prefix in seen_prefixes:
+            continue
+        seen_prefixes.add(prefix)
+        for path in sorted(mask_dir.glob(f"{prefix}-*")):
+            if not path.is_file() or path.suffix.lower() not in _MASK_EXTENSIONS:
+                continue
+            mask = _read_mask_file(path)
+            if mask is not None:
+                logger.info("[WATERMARK] Dùng mask cùng nhóm theo prefix: %s", path.name)
+                return mask
+
+    # 3) Mask dùng chung watermark.png (fallback cuối).
+    global_path = mask_dir / f"{GLOBAL_MASK_STEM}.png"
+    if global_path.is_file():
+        mask = _read_mask_file(global_path)
+        if mask is not None:
+            return mask
     return None
+
+
+def read_mask_file_bytes(key: str) -> Optional[bytes]:
+    """Bytes file mask đã lưu cho key (exact key, KHÔNG qua fallback chain) —
+    cho frontend nạp lại mask đang có vào editor xem/sửa. Mask chỉ được UI này
+    lưu dạng PNG nên tra đúng file .png của key."""
+    path = mask_path_for_key(key)
+    if not path.is_file():
+        return None
+    try:
+        return path.read_bytes()
+    except OSError as e:
+        logger.warning("[WATERMARK] Không đọc được file mask %s: %s", path.name, e)
+        return None
 
 
 def save_mask_for_key(key: str, png_bytes: bytes) -> Path:

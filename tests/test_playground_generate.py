@@ -169,7 +169,7 @@ def test_job_flow_running_to_done_appends_results(tmp_path, monkeypatch):
     }
     counter = {"n": 0}
 
-    async def fake_item(p, api_key):
+    async def fake_item(p, api_key, client=None):
         counter["n"] += 1
         return {
             "id": f"item-{counter['n']}",
@@ -198,7 +198,7 @@ def test_job_all_items_failed_marks_error(tmp_path, monkeypatch):
     params = {"mode": "image", "model": "nano-banana-pro", "base": "gemini-3.0-pro-image",
               "ratio": "16:9", "res": "1K", "length": None, "qty": 2, "prompt": "x"}
 
-    async def failing_item(p, api_key):
+    async def failing_item(p, api_key, client=None):
         raise RuntimeError("no url")
 
     monkeypatch.setattr(generation, "_generate_single_playground_item", failing_item)
@@ -321,6 +321,39 @@ def test_generate_endpoint_spawns_job(playground_client, monkeypatch):
     assert status.json()["status"] == "running"
 
 
+def test_generate_job_targets_the_logged_in_api_url(playground_client, monkeypatch):
+    client, database = playground_client
+    # Login qua endpoint tuỳ chọn — patch class-level để phủ cả instance mới
+    # mà get_flow_client tạo ra cho URL đó.
+    async def fake_validate(self, key):
+        self.last_check_error = None
+        return key == "test-key"
+
+    monkeypatch.setattr("app.generation.FlowClient.validate_key", fake_validate)
+    assert client.post(
+        "/playground/session",
+        json={"api_url": "http://flow.local:1234", "api_key": "test-key"},
+    ).status_code == 204
+    project = _create_project(client)
+
+    captured = {}
+
+    def fake_spawn(coro):
+        # Đọc tham số api_url trước khi đóng coroutine (frame bị xoá sau close).
+        captured["api_url"] = coro.cr_frame.f_locals.get("api_url")
+        coro.close()
+        return None
+
+    monkeypatch.setattr(generation, "spawn_job", fake_spawn)
+    response = client.post(
+        f"/playground/api/projects/{project['id']}/generate",
+        json=_GOOD_BODY,
+        headers=_mutation_headers(),
+    )
+    assert response.status_code == 202
+    assert captured["api_url"] == "http://flow.local:1234"
+
+
 # ── 5. Watermark mask API ────────────────────────────────────────────
 
 
@@ -418,3 +451,130 @@ def test_compose_frames_and_extend_requests():
     # extend: landscape key không có suffix, portrait có
     assert g._compose_video_extend_request("16:9")[0] == "veo_3_1_extend"
     assert g._compose_video_extend_request("9:16")[0] == "veo_3_1_extend_portrait"
+
+
+def test_compose_chat_body_image_with_references_sends_image_parts():
+    """i2i image: có ảnh tham chiếu thì content phải là parts chứa image_url —
+    không được nuốt refs rồi để upstream nhận has_images=false."""
+    from app import generation as g
+
+    data_url = "data:image/png;base64,aGVsbG8="
+    params = {
+        "mode": "image",
+        "base": "gemini_2_5_flash_image",
+        "ratio": "9:16",
+        "res": "1K",
+        "prompt": "vẽ thêm một con khỉ nằm cạnh",
+    }
+    # Không refs: content giữ dạng string như cũ.
+    _, body = g._compose_chat_body(params, [])
+    assert body["messages"][0]["content"] == "vẽ thêm một con khỉ nằm cạnh"
+
+    # Có refs: content là parts text + image_url data URL.
+    _, body = g._compose_chat_body(params, [data_url])
+    content = body["messages"][0]["content"]
+    assert isinstance(content, list)
+    assert content[0] == {"type": "text", "text": "vẽ thêm một con khỉ nằm cạnh"}
+    assert {"type": "image_url", "image_url": {"url": data_url}} in content
+
+    # Video t2v không refs vẫn string.
+    _, body = g._compose_chat_body(
+        {
+            "mode": "video",
+            "base": "veo_3_1_t2v",
+            "length": 8,
+            "res": None,
+            "ratio": "9:16",
+            "prompt": "p",
+        },
+        [],
+    )
+    assert body["messages"][0]["content"] == "p"
+
+
+# ── 7. Meta contract "Re use prompt" — prompt/references/vmode trong meta ──
+
+
+class _FakeGenClient:
+    """FlowClient giả: trả URL hợp lệ cho cả non-stream (image) lẫn stream (video)."""
+
+    async def generate(self, api_key, body):
+        return {"choices": [{"message": {"content": "![img](/tmp/qa.png)"}}]}
+
+    async def generate_stream(self, api_key, body):
+        return {"url": "/tmp/qa.mp4", "media_id": "media-1"}
+
+    async def download_media(self, url):
+        return b"fake-media-bytes", ".png"
+
+
+def _patch_media_pipeline(monkeypatch, tmp_path):
+    async def fake_remove_watermark(raw, ext, key, fallback_keys=None):
+        return raw, "skipped:no_mask"
+
+    monkeypatch.setattr(generation.watermark, "remove_watermark", fake_remove_watermark)
+    monkeypatch.setattr(generation, "RESULTS_DIR", tmp_path)
+
+
+def test_single_item_meta_carries_prompt_references_vmode(monkeypatch, tmp_path):
+    """Mọi item kết quả phải mang prompt + id refs user chọn; video thêm vmode."""
+    _patch_media_pipeline(monkeypatch, tmp_path)
+
+    image_params = {
+        "mode": "image", "model": "nano-banana-pro", "base": "gemini-3.0-pro-image",
+        "ratio": "9:16", "res": "1K", "length": None, "qty": 1,
+        "prompt": "mèo đeo kính", "vmode": "text",
+        "references": ["ref-1", "ref-2"],
+    }
+    item = asyncio.run(
+        generation._generate_single_playground_item(image_params, "k", _FakeGenClient())
+    )
+    assert item["meta"]["prompt"] == "mèo đeo kính"
+    # references là ID item user đã chọn, không phải URL.
+    assert item["meta"]["references"] == ["ref-1", "ref-2"]
+    # vmode chỉ có nghĩa với video — image không cần.
+    assert "vmode" not in item["meta"]
+
+    video_params = {
+        "mode": "video", "model": "veo-3.1-fast", "base": "veo_3_1_t2v_fast",
+        "ratio": "16:9", "res": None, "length": 8, "qty": 1,
+        "prompt": "chiếc xe chạy", "vmode": "text", "references": [],
+    }
+    video_item = asyncio.run(
+        generation._generate_single_playground_item(video_params, "k", _FakeGenClient())
+    )
+    assert video_item["meta"]["prompt"] == "chiếc xe chạy"
+    assert video_item["meta"]["references"] == []
+    assert video_item["meta"]["vmode"] == "text"
+    assert video_item["meta"]["media_generation_id"] == "media-1"
+
+
+def test_single_item_extend_meta_keeps_reuse_contract(monkeypatch, tmp_path):
+    """Nhánh Extend cũng phải mang đủ prompt/references/vmode (vmode='extend')."""
+
+    class FakeExtendClient:
+        async def generate_stream(self, api_key, body):
+            return {"url": "/tmp/qa2.mp4", "media_id": "media-2"}
+
+        async def download_media(self, url):
+            return b"fake-video-bytes", ".mp4"
+
+    async def fake_crop(path, percent):
+        return "skipped:disabled"
+
+    monkeypatch.setattr(generation.watermark, "crop_video_percent", fake_crop)
+    _patch_media_pipeline(monkeypatch, tmp_path)
+    params = {
+        "mode": "video", "model": "veo-3.1-fast", "base": "veo_3_1_extend",
+        "ratio": "16:9", "res": None, "length": None, "qty": 1,
+        "prompt": "tiếp tục cảnh", "vmode": "extend", "references": [],
+        "extend_item_id": "item-src", "extend_media_id": "media-src",
+        "crop_like_lite": False,
+    }
+    item = asyncio.run(
+        generation._generate_single_playground_item(params, "k", FakeExtendClient())
+    )
+    assert item["meta"]["prompt"] == "tiếp tục cảnh"
+    assert item["meta"]["references"] == []
+    assert item["meta"]["vmode"] == "extend"
+    assert item["meta"]["extend_source_item"] == "item-src"

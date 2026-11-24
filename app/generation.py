@@ -16,6 +16,8 @@ import json
 import logging
 import mimetypes
 import re
+import shutil
+import subprocess
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -522,6 +524,212 @@ def _now_ms() -> int:
 
 
 # ──────────────────────────────────────────────────────────────────
+# Tên item tự sinh từ prompt (server-side, dedupe additive)
+# ──────────────────────────────────────────────────────────────────
+
+ITEM_NAME_MAX_CHARS = 20
+
+
+def _item_base_name(prompt: str | None) -> str:
+    """Tên gốc cho item generation: prompt đã trim, cắt 20 ký tự đầu; prompt
+    dài hơn 20 ký tự thì thêm "…" vào cuối. Python str slice theo codepoint
+    nên an toàn với tiếng Nhật/emoji (không cắt giữa surrogate pair).
+    """
+    name = (prompt or "").strip()
+    if not name:
+        return ""
+    if len(name) <= ITEM_NAME_MAX_CHARS:
+        return name
+    return name[:ITEM_NAME_MAX_CHARS] + "…"
+
+
+def _assign_generated_item_names(
+    project: dict | None, items: list, prompt: str | None, base_name: str | None = None
+) -> list:
+    """Gán ``name`` cho item kết quả generation chưa có name (hoặc name rỗng),
+    dedupe với tên item đã có trong project VÀ tên các item khác trong cùng
+    batch bằng suffix " (2)", " (3)"...
+
+    Item do user tự đặt tên (ảnh tham chiếu/upload) được giữ nguyên — chỉ ghi
+    vào item chưa có name. Mutate items in place và trả về ``items``.
+
+    ``base_name`` cho phép caller truyền sẵn tên gốc (vd trim video: "{tên
+    item gốc} (trim)") thay vì suy ra từ prompt — truyền thì ``prompt`` bị bỏ
+    qua. Generation chỉ truyền prompt nên hành vi cũ giữ nguyên.
+    """
+    base = (str(base_name).strip() if base_name is not None else "") or _item_base_name(prompt)
+    if not base:
+        return items
+    taken: set[str] = set()
+    for item in (project or {}).get("results") or []:
+        if isinstance(item, dict):
+            existing = str(item.get("name") or "").strip()
+            if existing:
+                taken.add(existing)
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        existing = str(item.get("name") or "").strip()
+        if existing:
+            # Item user đã đặt tên: giữ nguyên, nhưng chặn item sau trong batch
+            # trùng đúng tên đó.
+            taken.add(existing)
+            continue
+        candidate = base
+        counter = 2
+        while candidate in taken:
+            candidate = f"{base} ({counter})"
+            counter += 1
+        item["name"] = candidate
+        taken.add(candidate)
+    return items
+
+
+# ──────────────────────────────────────────────────────────────────
+# Trim video (ffmpeg) — cắt giữ lại đoạn [start, end) thành item mới
+# ──────────────────────────────────────────────────────────────────
+
+TRIM_MIN_DURATION_SEC = 0.2
+TRIM_MAX_DURATION_SEC = 120.0
+# Dung sai so với độ dài video thật (ffprobe làm tròn theo container/keyframe).
+TRIM_END_TOLERANCE_SEC = 0.5
+TRIM_SUBPROCESS_TIMEOUT_SEC = 60
+_RESULTS_URL_PREFIX = "/tmp/playground_results/"
+
+
+class TrimVideoError(RuntimeError):
+    """ffmpeg/subprocess thất bại khi cắt video — message chỉ dùng để log
+    server-side, không trả thẳng cho client (có thể chứa path hệ thống)."""
+
+
+def _find_ffmpeg() -> str | None:
+    return shutil.which("ffmpeg")
+
+
+def _resolve_results_file(url) -> Path:
+    """URL item (``/tmp/playground_results/<file>``) → Path thật trong RESULTS_DIR.
+
+    Từ chối URL không thuộc RESULTS_DIR, kể cả traversal ``../`` — chặn đọc file
+    ngoài thư mục kết quả. ValueError mang message tự viết, không lộ path hệ thống.
+    """
+    if not isinstance(url, str) or not url.startswith(_RESULTS_URL_PREFIX):
+        raise ValueError("File video của item không hợp lệ.")
+    results_dir = RESULTS_DIR.resolve()
+    candidate = (results_dir / url[len(_RESULTS_URL_PREFIX):]).resolve()
+    if not candidate.is_relative_to(results_dir):
+        raise ValueError("File video của item không hợp lệ.")
+    return candidate
+
+
+def probe_video_duration_sync(path: Path) -> float | None:
+    """Độ dài video (giây) qua ffprobe; None nếu thiếu ffprobe hoặc đọc lỗi."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    cmd = [
+        ffprobe,
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=TRIM_SUBPROCESS_TIMEOUT_SEC)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return float(result.stdout.decode("ascii", errors="ignore").strip())
+    except ValueError:
+        return None
+
+
+async def probe_video_duration(path: Path) -> float | None:
+    """Async wrapper (ffprobe chạy trong thread riêng, không block event loop)."""
+    return await asyncio.to_thread(probe_video_duration_sync, path)
+
+
+def trim_video_file_sync(src: Path, start: float, duration: float, dst: Path) -> Path:
+    """Đồng bộ: cắt ``[start, start+duration)`` của src → dst (mp4).
+
+    Lượt 1 dùng ``-c copy`` (không re-encode — nhanh, giữ nguyên chất lượng);
+    codec lạ không đóng gói được vào mp4 thì retry re-encode libx264+aac.
+    Mọi lượt fail đều xoá file dở để không rác trong RESULTS_DIR.
+    """
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg:
+        raise TrimVideoError("Máy chủ chưa cài ffmpeg.")
+    seek_args = ["-ss", f"{start:.3f}", "-i", str(src), "-t", f"{duration:.3f}"]
+    attempts = (
+        seek_args + ["-c", "copy", "-movflags", "+faststart"],
+        # Fallback codec lạ: re-encode H.264 + AAC (giống style crop WM của watermark.py).
+        seek_args + [
+            "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-movflags", "+faststart",
+        ],
+    )
+    last_error = "unknown"
+    for extra_args in attempts:
+        cmd = [ffmpeg, "-y", *extra_args, str(dst)]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=TRIM_SUBPROCESS_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:
+            last_error = f"ffmpeg timeout sau {TRIM_SUBPROCESS_TIMEOUT_SEC}s"
+            dst.unlink(missing_ok=True)
+            continue
+        except OSError as exc:
+            last_error = f"subprocess {type(exc).__name__}"
+            dst.unlink(missing_ok=True)
+            continue
+        if result.returncode == 0 and dst.is_file() and dst.stat().st_size > 0:
+            return dst
+        stderr_tail = (
+            result.stderr.decode("utf-8", errors="ignore")[-300:] if result.stderr else ""
+        )
+        last_error = f"returncode={result.returncode} stderr={stderr_tail!r}"
+        dst.unlink(missing_ok=True)
+    raise TrimVideoError(last_error)
+
+
+async def trim_video_file(src: Path, start: float, duration: float, dst: Path) -> Path:
+    """Async trim (chạy trong thread riêng, không block event loop)."""
+    return await asyncio.to_thread(trim_video_file_sync, src, start, duration, dst)
+
+
+async def trim_playground_video_item(source_item: dict, start: float, end: float) -> dict:
+    """Cắt item video trong project thành item MỚI — file và item gốc giữ nguyên.
+
+    meta copy từ item gốc NHƯNG bỏ ``media_generation_id`` (bản trim không tồn
+    tại trên Flow nên không extend tiếp được), thêm ``trimmed_from`` = id item
+    gốc, và cập nhật ``length`` theo độ dài thực của file mới (nếu meta gốc có
+    length). ValueError = request sai (path lạ / file mất / end vượt độ dài).
+    """
+    src = _resolve_results_file(source_item.get("url"))
+    if not src.is_file():
+        raise ValueError("File video của item không còn tồn tại.")
+    total = await probe_video_duration(src)
+    if total is not None and end > total + TRIM_END_TOLERANCE_SEC:
+        raise ValueError(f"Đoạn cắt vượt quá độ dài video ({total:.1f}s).")
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    dst = RESULTS_DIR / f"{uuid.uuid4().hex}.mp4"
+    await trim_video_file(src, start, end - start, dst)
+    new_duration = await probe_video_duration(dst)
+    meta = dict(source_item.get("meta") or {})
+    meta.pop("media_generation_id", None)
+    meta["trimmed_from"] = str(source_item.get("id") or "")
+    if "length" in meta:
+        meta["length"] = round(new_duration if new_duration is not None else end - start)
+    return {
+        "id": str(uuid.uuid4()),
+        "kind": "video",
+        "url": f"{_RESULTS_URL_PREFIX}{dst.name}",
+        "created_at": _now_ms(),
+        "meta": meta,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────
 # HTTP client sang flow2api
 # ──────────────────────────────────────────────────────────────────
 
@@ -536,20 +744,32 @@ class FlowClient:
             timeout=httpx.Timeout(FLOW2API_TIMEOUT),
             follow_redirects=True,
         )
+        # Phân loại lỗi lần check key gần nhất: None / 'unreachable' / 'unauthorized'.
+        self.last_check_error: str | None = None
 
     async def aclose(self):
         await self._client.aclose()
 
-    async def validate_key(self, api_key: str) -> bool:
-        """Key hợp lệ khi flow2api /v1/models chấp nhận Bearer key này."""
+    async def check_key(self, api_key: str) -> str | None:
+        """Key hợp lệ khi flow2api /v1/models chấp nhận Bearer key này.
+
+        Trả None nếu hợp lệ; 'unreachable' nếu không kết nối được endpoint;
+        'unauthorized' nếu endpoint từ chối key. Kết quả cũng lưu vào
+        ``last_check_error`` để caller phân loại lỗi khi validate_key trả False.
+        """
         try:
             response = await self._client.get(
                 "/v1/models", headers={"Authorization": f"Bearer {api_key}"}
             )
         except httpx.HTTPError as exc:
             logger.error("Không kết nối được flow2api %s: %s", self.base_url, exc)
-            return False
-        return response.status_code == 200
+            self.last_check_error = "unreachable"
+            return self.last_check_error
+        self.last_check_error = None if response.status_code == 200 else "unauthorized"
+        return self.last_check_error
+
+    async def validate_key(self, api_key: str) -> bool:
+        return await self.check_key(api_key) is None
 
     async def generate(self, api_key: str, body: dict) -> dict:
         """POST /v1/chat/completions (non-stream); trả payload JSON."""
@@ -640,6 +860,21 @@ class FlowClient:
 
 flow_client = FlowClient()
 
+# Client theo endpoint do user nhập lúc login — cache dùng lại để không tạo
+# connection pool mới mỗi job. None/rỗng → client mặc định theo env config.
+_flow_clients: dict[str, FlowClient] = {}
+
+
+def get_flow_client(base_url: str | None = None) -> FlowClient:
+    if not base_url:
+        return flow_client
+    url = base_url.strip().rstrip("/")
+    client = _flow_clients.get(url)
+    if client is None:
+        client = FlowClient(url)
+        _flow_clients[url] = client
+    return client
+
 
 # ──────────────────────────────────────────────────────────────────
 # Compose body + hậu xử lý kết quả (download + watermark)
@@ -699,7 +934,9 @@ def _compose_chat_body(params: dict, reference_data_urls: list[str]) -> tuple[st
                 "image_url": {"url": f"extend://{params['extend_media_id']}"},
             }
         )
-    content = params["prompt"] if (mode == "image" or not parts[1:]) else parts
+    # Có ảnh tham chiếu (image i2i / video frames-ingredients-extend) thì gửi
+    # content dạng parts; chỉ prompt thuần mới gửi string.
+    content = params["prompt"] if not parts[1:] else parts
     body = {
         "model": request_model,
         "messages": [{"role": "user", "content": content}],
@@ -717,8 +954,9 @@ _MIME_BY_EXT = {
 }
 
 
-async def _read_reference_data_url(url: str) -> str:
+async def _read_reference_data_url(url: str, client: FlowClient | None = None) -> str:
     """Đọc ảnh tham chiếu (file local /tmp hoặc URL) → data URL base64."""
+    client = client or flow_client
     if url.startswith("/"):
         # File local của playground (refs upload hoặc kết quả đã lưu local).
         local_path = TMP_DIR / url.removeprefix("/tmp/")
@@ -728,7 +966,7 @@ async def _read_reference_data_url(url: str) -> str:
             raise RuntimeError(f"Ảnh tham chiếu không đọc được: {url}") from exc
         ext = local_path.suffix.lower()
     elif url.startswith("http://") or url.startswith("https://"):
-        raw, ext = await flow_client.download_media(url)
+        raw, ext = await client.download_media(url)
     else:
         raise RuntimeError(f"URL ảnh tham chiếu không hợp lệ: {url[:80]}")
     mime = _MIME_BY_EXT.get(ext, "image/jpeg")
@@ -736,19 +974,41 @@ async def _read_reference_data_url(url: str) -> str:
 
 
 def _mask_keys_for(params: dict) -> tuple[str, list[str]]:
-    """(key chính, fallback keys) cho mask WM: {base}:{ratio} + mask legacy."""
+    """(key chính, fallback keys) cho mask WM — chuẩn hoá ở MỘT chỗ duy nhất.
+
+    WM layout KHÁC nhau giữa các res (1K ≠ 2K) nên mask phải theo đúng res —
+    một mask theo ratio dùng chung cho 1K/2K sẽ xoá WM sai vùng. Thứ tự tra
+    mask (mọi key đều đi qua watermark.load_mask_for_key, thêm prefix-sweep +
+    watermark.png dùng chung ở tầng đó):
+      1. ``{base}:{ratio}:{res}``  — key playground hiện tại, frontend lưu mask
+         theo key này (vd ``gemini-3.0-pro-image:9:16:2k``). Image sau validate
+         luôn có res (mặc định 1K).
+      2. ``{base}-{orient}-{res}`` — legacy catalog key đã resolve (vd
+         ``gemini-3.0-pro-image-portrait-2k``). Orientation là giá trị ĐẦY ĐỦ của
+         ASPECT_RATIO_MAP (landscape/square/three-four/four-three/portrait) —
+         không được thu gọn về portrait/landscape, nếu không mask đã lưu cho
+         4:3/1:1/3:4 sẽ không bao giờ khớp (hoặc tệ hơn, khớp nhầm mask của
+         nhóm landscape và xoá WM sai vùng).
+      3. ``{base}-{orient}``       — legacy không suffix res.
+
+    Mỗi playground ratio map sang đúng MỘT nhóm orientation, các nhóm không
+    được lẫn nhau (mask 9:16 không áp dụng cho 3:4 — khung khác nhau); mask lệch
+    suffix res trong cùng nhóm legacy do prefix-sweep của load_mask_for_key xử lý.
+    Gọi không có res (legacy) → giữ nguyên key cũ ``{base}:{ratio}``.
+    """
     base = params["base"]
-    orient = _playground_orientation(params["ratio"])
-    fallbacks = []
-    if params.get("res"):
-        fallbacks.append(f"{base}-{orient}-{params['res'].lower()}")
-    fallbacks.append(f"{base}-{orient}")
-    return f"{base}:{params['ratio']}", fallbacks
+    ratio = params["ratio"]
+    orient = ASPECT_RATIO_MAP.get(ratio) or _playground_orientation(ratio)
+    res = str(params.get("res") or "").strip().lower()
+    if res:
+        return f"{base}:{ratio}:{res}", [f"{base}-{orient}-{res}", f"{base}-{orient}"]
+    return f"{base}:{ratio}", [f"{base}-{orient}"]
 
 
-async def _finalize_image(url: str, params: dict) -> dict:
+async def _finalize_image(url: str, params: dict, client: FlowClient | None = None) -> dict:
     """Tải ảnh kết quả về, xoá WM (nếu bật + có mask), lưu tmp local."""
-    raw, ext = await flow_client.download_media(url)
+    client = client or flow_client
+    raw, ext = await client.download_media(url)
     key, fallbacks = _mask_keys_for(params)
     result, status = await watermark.remove_watermark(raw, ext, key, fallback_keys=fallbacks)
     logger.info(
@@ -761,14 +1021,15 @@ async def _finalize_image(url: str, params: dict) -> dict:
     return _media_item("image", f"/tmp/playground_results/{filename}", params["meta"])
 
 
-async def _finalize_video(url: str, params: dict) -> dict:
+async def _finalize_video(url: str, params: dict, client: FlowClient | None = None) -> dict:
     """Tải video về; crop viền WM nếu bật + model lite (hoặc extend từ lite);
     lưu tmp local kèm mediaGenerationId (nếu có) để hỗ trợ Extend.
 
     Tải không được (CDN chặn, hết hạn...) thì giữ nguyên URL gốc như hành vi cũ.
     """
+    client = client or flow_client
     try:
-        raw, ext = await flow_client.download_media(url)
+        raw, ext = await client.download_media(url)
     except Exception as exc:
         logger.warning("Không tải được video về local, giữ URL gốc: %s", exc)
         return _media_item("video", url, params["meta"])
@@ -804,12 +1065,15 @@ async def _finalize_video(url: str, params: dict) -> dict:
     return item
 
 
-async def _generate_single_playground_item(params: dict, api_key: str) -> dict:
+async def _generate_single_playground_item(
+    params: dict, api_key: str, client: FlowClient | None = None
+) -> dict:
     """Chạy một lượt generation; ném exception nếu item này thất bại."""
+    client = client or flow_client
     reference_data_urls: list[str] = []
     if params.get("reference_urls"):
         for ref_url in params["reference_urls"]:
-            reference_data_urls.append(await _read_reference_data_url(ref_url))
+            reference_data_urls.append(await _read_reference_data_url(ref_url, client))
 
     request_model, body = _compose_chat_body(params, reference_data_urls)
     logger.info(
@@ -822,18 +1086,26 @@ async def _generate_single_playground_item(params: dict, api_key: str) -> dict:
         "ratio": params["ratio"],
         "res": params["res"],
         "length": params["length"],
+        # Contract "Re use prompt": frontend đọc lại các field này từ meta item
+        # để đặt lại form (prompt + id ảnh tham chiếu user đã chọn + vmode).
+        # Item cũ trong DB thiếu field không sao — additive-only.
+        "prompt": params["prompt"],
+        "references": list(params.get("references") or []),
     }
+    if params["mode"] == "video":
+        # vmode chỉ có nghĩa với video (text/frames/ingredients/extend).
+        meta["vmode"] = params.get("vmode") or "text"
     if params.get("vmode") == "extend":
         meta["model"] = "veo-3.1-extend"
         meta["extend_source_item"] = params.get("extend_item_id")
 
     if params["mode"] == "video":
         # Video chạy stream:true — chunk cuối mang mediaGenerationId cần cho Extend.
-        streamed = await flow_client.generate_stream(api_key, body)
+        streamed = await client.generate_stream(api_key, body)
         url = streamed["url"]
         meta["media_generation_id"] = streamed["media_id"]
     else:
-        payload = await flow_client.generate(api_key, body)
+        payload = await client.generate(api_key, body)
         url = _extract_url_from_openai_payload(payload)
         if not url:
             raise RuntimeError(_payload_error_message(payload))
@@ -841,8 +1113,71 @@ async def _generate_single_playground_item(params: dict, api_key: str) -> dict:
     item_params = dict(params)
     item_params["meta"] = meta
     if params["mode"] == "image":
-        return await _finalize_image(url, item_params)
-    return await _finalize_video(url, item_params)
+        return await _finalize_image(url, item_params, client)
+    return await _finalize_video(url, item_params, client)
+
+
+# ── Ảnh ví dụ làm nền vẽ mask WM ─────────────────────────────────────────────
+
+
+# Prompt trung tính: chỉ cần 1 ảnh đầy khung, chi tiết để nhìn rõ vị trí WM.
+SAMPLE_PROMPT = (
+    "Ảnh ví dụ để căn vị trí watermark: bức ảnh phong cảnh tự nhiên chi tiết, "
+    "ánh sáng đồng đều, nét rõ, không chữ, không logo."
+)
+
+
+async def generate_watermark_sample(
+    model_id: str, ratio: str, res: str, api_key: str, api_url: str | None = None
+) -> dict:
+    """Tạo 1 ảnh ví dụ cho model image + ratio + res để làm nền vẽ mask WM.
+
+    Khác pipeline generate thường: KHÔNG qua remove_watermark — ảnh giữ nguyên
+    watermark (vì mục đích của sample là thấy đúng chỗ WM cần tô). WM layout
+    khác nhau theo res nên sample phải gen đúng res của key đang vẽ. Ảnh được
+    lưu vào thư mục mask (prefix sample_) và dùng lại cho các lần mở editor sau.
+    Trả {"key", "filename", "url"} — url là endpoint GET sample cho frontend.
+    """
+    entry = next(
+        (item for item in playground_gen_options()["image"]["models"] if item["id"] == model_id),
+        None,
+    )
+    if entry is None or not isinstance(entry.get("base"), str) or not entry["base"]:
+        raise ValueError("Model không phải model image có base alias.")
+    if ratio not in entry["ratios"]:
+        raise ValueError("Tỉ lệ khung hình không được hỗ trợ cho model này.")
+    res = str(res or "").strip() or "1K"
+    supported = [str(item).lower() for item in (entry.get("res") or [])]
+    if supported and res.lower() not in supported:
+        # Không degrade như validate_generate_payload — sample gen sai res thì
+        # mask vẽ lên sẽ sai vị trí WM, im lặng còn tệ hơn báo lỗi.
+        raise ValueError("Res không được hỗ trợ cho model này.")
+
+    params = {
+        "mode": "image",
+        "model": model_id,
+        "base": entry["base"],
+        "ratio": ratio,
+        "res": res,
+        "length": None,
+        "prompt": SAMPLE_PROMPT,
+    }
+    client = get_flow_client(api_url)
+    _request_model, body = _compose_chat_body(params, [])
+    payload = await client.generate(api_key, body)
+    url = _extract_url_from_openai_payload(payload)
+    if not url:
+        raise RuntimeError(_payload_error_message(payload))
+    # Tải về giữ nguyên bytes — sample phải phản ánh đúng vị trí watermark.
+    raw, ext = await client.download_media(url)
+    key = f"{entry['base']}:{ratio}:{res.lower()}"
+    path = watermark.save_sample_for_key(key, raw, ext)
+    safe_key = watermark.sanitize_key(key)
+    return {
+        "key": safe_key,
+        "filename": path.name,
+        "url": f"/playground/api/watermark/sample/{safe_key}",
+    }
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -850,13 +1185,16 @@ async def _generate_single_playground_item(params: dict, api_key: str) -> dict:
 # ──────────────────────────────────────────────────────────────────
 
 
-async def execute_playground_generation(params: dict, api_key: str) -> tuple[list[dict], list[str]]:
+async def execute_playground_generation(
+    params: dict, api_key: str, client: FlowClient | None = None
+) -> tuple[list[dict], list[str]]:
     """Chạy qty generation độc lập song song (Semaphore 4), giữ thứ tự index."""
+    client = client or flow_client
     semaphore = asyncio.Semaphore(4)
 
     async def run_one() -> dict:
         async with semaphore:
-            return await _generate_single_playground_item(params, api_key)
+            return await _generate_single_playground_item(params, api_key, client)
 
     outcomes = await asyncio.gather(
         *(run_one() for _ in range(params["qty"])), return_exceptions=True
@@ -880,10 +1218,19 @@ async def run_playground_generate_job(
     job_id: str,
     params: dict,
     api_key: str,
+    api_url: str | None = None,
 ):
+    # Client theo endpoint user đăng nhập (fallback: env FLOW2API_BASE_URL).
+    client = get_flow_client(api_url)
     try:
-        items, errors = await execute_playground_generation(params, api_key)
+        items, errors = await execute_playground_generation(params, api_key, client)
         if items:
+            # Đặt tên item từ prompt TRƯỚC khi append — đọc tên hiện có của
+            # project để dedupe. Project bị xoá giữa chừng thì bỏ qua naming,
+            # append bên dưới sẽ đánh dấu job lỗi như cũ.
+            project = await playground_db.get_project(owner_hash, project_id)
+            if project is not None:
+                _assign_generated_item_names(project, items, params.get("prompt"))
             project = await playground_db.append_results(owner_hash, project_id, items)
             if project is None:
                 await playground_db.update_job_status(

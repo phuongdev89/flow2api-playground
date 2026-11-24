@@ -48,7 +48,8 @@ class PlaygroundDatabase:
                         token_hash TEXT PRIMARY KEY,
                         owner_hash TEXT NOT NULL,
                         expires_at INTEGER NOT NULL,
-                        api_key TEXT
+                        api_key TEXT,
+                        api_url TEXT
                     );
                     CREATE INDEX IF NOT EXISTS idx_playground_sessions_expiry
                         ON playground_sessions(expires_at);
@@ -77,12 +78,17 @@ class PlaygroundDatabase:
                     """
                 )
                 # Migration từ DB copy từ flow2api cũ: bảng playground_sessions có
-                # thể chưa có cột api_key — thêm nếu thiếu (DB cũ giữ nguyên data).
+                # thể chưa có cột api_key/api_url — thêm nếu thiếu (DB cũ giữ nguyên
+                # data; session cũ không có api_url → fallback theo env config).
                 cursor = await db.execute("PRAGMA table_info(playground_sessions)")
                 columns = {row[1] for row in await cursor.fetchall()}
                 if "api_key" not in columns:
                     await db.execute(
                         "ALTER TABLE playground_sessions ADD COLUMN api_key TEXT"
+                    )
+                if "api_url" not in columns:
+                    await db.execute(
+                        "ALTER TABLE playground_sessions ADD COLUMN api_url TEXT"
                     )
                 # Job 'running' cũ (quá JOB_ORPHAN_STALE_MS) sau khi server khởi động
                 # lại là job mồ côi (background task đã mất) → đánh dấu lỗi để client
@@ -101,7 +107,12 @@ class PlaygroundDatabase:
             self._ready = True
 
     async def create_session(
-        self, token_hash: str, owner_hash: str, expires_at: int, api_key: str | None = None
+        self,
+        token_hash: str,
+        owner_hash: str,
+        expires_at: int,
+        api_key: str | None = None,
+        api_url: str | None = None,
     ):
         await self._initialize()
         async with self._connect() as db:
@@ -109,9 +120,9 @@ class PlaygroundDatabase:
                 "DELETE FROM playground_sessions WHERE expires_at <= ?", (int(time.time()),)
             )
             await db.execute(
-                "INSERT INTO playground_sessions(token_hash, owner_hash, expires_at, api_key) "
-                "VALUES (?, ?, ?, ?)",
-                (token_hash, owner_hash, expires_at, api_key),
+                "INSERT INTO playground_sessions(token_hash, owner_hash, expires_at, api_key, api_url) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (token_hash, owner_hash, expires_at, api_key, api_url),
             )
             await db.commit()
 
@@ -128,19 +139,25 @@ class PlaygroundDatabase:
             await db.commit()
         return row["owner_hash"] if row else None
 
-    async def api_key_for_owner(self, owner_hash: str) -> str | None:
-        """Key flow2api của owner (session còn hạn gần nhất) — dùng cho job nền."""
+    async def api_credentials_for_owner(self, owner_hash: str) -> tuple[str | None, str | None]:
+        """(api_key, api_url) của owner (session còn hạn gần nhất) — dùng cho job nền.
+
+        Session cũ trước khi thêm api_url trả api_url=None → caller fallback về
+        endpoint mặc định theo env config.
+        """
         await self._initialize()
         now = int(time.time())
         async with self._connect() as db:
             cursor = await db.execute(
-                "SELECT api_key FROM playground_sessions "
+                "SELECT api_key, api_url FROM playground_sessions "
                 "WHERE owner_hash = ? AND expires_at > ? AND api_key IS NOT NULL "
                 "ORDER BY expires_at DESC LIMIT 1",
                 (owner_hash, now),
             )
             row = await cursor.fetchone()
-        return row["api_key"] if row else None
+        if row is None:
+            return None, None
+        return row["api_key"], row["api_url"]
 
     async def revoke_session(self, token_hash: str):
         await self._initialize()
@@ -270,6 +287,9 @@ class PlaygroundDatabase:
             "error": row["error"],
             "results": json.loads(row["results_json"]),
             "created_at": row["created_at"],
+            # Additive (frontend đọc thêm tuỳ ý); job list endpoint dùng để
+            # khôi phục queue sau F5 nên có updated_at là tiện cho sắp xếp UI.
+            "updated_at": row["updated_at"],
         }
 
     async def create_job(self, job_id: str, owner_hash: str, project_id: str) -> dict:
@@ -322,6 +342,25 @@ class PlaygroundDatabase:
             )
             row = await cursor.fetchone()
         return self._job(row) if row else None
+
+    async def list_jobs_for_project(
+        self, owner_hash: str, project_id: str, limit: int = 20
+    ) -> list[dict]:
+        """Job gần nhất của project, mới nhất trước (tối đa ``limit``).
+
+        Dùng để frontend khôi phục queue sau F5: job running giữ nguyên trong
+        bảng; job done/error cũ hơn 24h đã bị create_job dọn định kỳ nên không
+        cần lọc thêm. Khớp index (owner_hash, project_id, created_at DESC).
+        """
+        await self._initialize()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "SELECT * FROM playground_jobs WHERE owner_hash = ? AND project_id = ? "
+                "ORDER BY created_at DESC, id LIMIT ?",
+                (owner_hash, project_id, max(1, int(limit))),
+            )
+            rows = await cursor.fetchall()
+        return [self._job(row) for row in rows]
 
     async def update_job_status(
         self,

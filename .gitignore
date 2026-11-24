@@ -1,7 +1,14 @@
-# Runtime data
+# Runtime data — DB SQLite, torch cache, ảnh tham chiếu upload, kết quả generation
 data/
 tmp/
 config/
+
+# Mask WM: chỉ giữ README + các seed mask legacy đã track sẵn trong repo.
+# Mask và ảnh ví dụ (sample_*) do UI tạo là dữ liệu runtime của từng
+# deployment — không commit. Muốn đóng băng 1 mask làm seed mặc định thì
+# git add -f thủ công.
+masks/*
+!masks/README.md
 
 # Python
 __pycache__/
@@ -9,6 +16,11 @@ __pycache__/
 .pytest_cache/
 .venv/
 
-# OS
+# Env / log / editor / OS
+.env
+.env.*
+*.log
+.idea/
+.vscode/
 .DS_Store
 Thumbs.db

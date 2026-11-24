@@ -1,11 +1,13 @@
 const login = document.querySelector('#login');
 const form = document.querySelector('#login-form');
+const urlInput = document.querySelector('#api-url');
 const keyInput = document.querySelector('#api-key');
 const loginError = document.querySelector('#login-error');
 const loginButton = document.querySelector('#login-button');
 const workspace = document.querySelector('#workspace');
 const logout = document.querySelector('#logout');
 const wmSettingsButton = document.querySelector('#wm-settings');
+const densityPicker = document.querySelector('.density-picker');
 const prompt = document.querySelector('#prompt');
 const projectList = document.querySelector('#project-list');
 const emptyProjects = document.querySelector('#empty-projects');
@@ -46,6 +48,10 @@ const genResImageRow = document.querySelector('#gen-res-image');
 const composerRefs = document.querySelector('#composer-refs');
 const resultsGrid = document.querySelector('#results-grid');
 const resultsEmpty = document.querySelector('#results-empty');
+const selectionToolbar = document.querySelector('#selection-toolbar');
+const selectionCount = document.querySelector('#selection-count');
+const selectionClear = document.querySelector('#selection-clear');
+const selectionDelete = document.querySelector('#selection-delete');
 
 let projects = [];
 let activeProject = null;
@@ -53,13 +59,16 @@ let openActions = null;
 let resultColumns = 10;
 let promptSaveTimer;
 let toastTimer;
-// Generation jobs live server-side; these maps only track what this session knows.
-const activeJobs = new Map(); // project id -> job id
-const jobTimers = new Map(); // project id -> poll interval handle
-const submitting = new Set(); // project ids with a generate POST in flight
-const pendingByProject = new Map(); // project id -> { mode, ratio, count, startedAt }
-const jobResults = new Map(); // project id -> results delivered so far for the running job
+// Generation jobs live server-side; jobsById theo dõi TỪNG job riêng lẻ — mỗi
+// lần gửi là một job độc lập xếp hàng, composer không bao giờ khoá. Job đang
+// POST (chưa có job_id từ server) dùng khoá tạm "tmp:*". Queue được mirror vào
+// localStorage để sống sót qua F5 (reconcile theo GET /projects/{id}/jobs).
+const jobsById = new Map(); // job id -> { projectId, jobId, mode, ratio, count, startedAt, partial }
+const timersByJob = new Map(); // job id -> poll interval handle
+let tmpJobSeq = 0; // đánh số khoá tạm cho job đang POST
+const jobsFetchInFlight = new Map(); // project id -> Promise GET /jobs đang bay (dedupe poller)
 const COLUMNS_STORAGE_KEY = 'playground-columns';
+const JOB_QUEUE_KEY = 'playground_job_queue';
 
 // ── Selection (bôi chọn tham chiếu trong stage) ─────────────────────────
 // Chọn = tham chiếu: thứ tự chọn quyết định chip trong composer; role
@@ -191,6 +200,7 @@ function renderProjects(focusProject, focusMore = false) {
 
     select.addEventListener('click', async () => {
       activeProject = project.id;
+      exitExtendMode(); // nối tiếp gắn với project cũ — đổi project là hủy
       renderProjects(project.id);
       showProjectContents();
       try {
@@ -242,7 +252,7 @@ function renderProjects(focusProject, focusMore = false) {
         const response = await request(projectPath(project.id), { method: 'DELETE' });
         if (!response.ok) throw new Error('Project delete failed');
       projects = projects.filter(({ id }) => id !== project.id);
-      clearJobState(project.id);
+      clearProjectJobs(project.id);
       if (activeProject === project.id) activeProject = projects[0]?.id ?? null;
       renderProjects(activeProject);
         showProjectContents();
@@ -259,14 +269,20 @@ function renderProjects(focusProject, focusMore = false) {
   focusTarget?.focus();
 }
 
-function jobBusy(projectId) {
-  return Boolean(projectId && (activeJobs.has(projectId) || submitting.has(projectId)));
+function projectRunningCount(projectId) {
+  // Số job đang chạy của một project (gồm cả POST chưa trả job_id). Chỉ dùng để
+  // chặn bulk delete đua với append_results server-side — send KHÔNG bị chặn.
+  if (!projectId) return 0;
+  let count = 0;
+  for (const job of jobsById.values()) {
+    if (job.projectId === projectId) count += 1;
+  }
+  return count;
 }
 
 function syncComposerState() {
-  const busy = jobBusy(activeProject);
-  genTrigger.disabled = busy;
-  sendButton.disabled = busy || !prompt.value.trim();
+  // Composer không bao giờ khoá vì job đang chạy — mỗi lần gửi là một job mới.
+  sendButton.disabled = !prompt.value.trim();
 }
 
 function showProjectContents() {
@@ -275,6 +291,7 @@ function showProjectContents() {
   autoGrowPrompt();
   syncComposerState();
   resumePollingIfNeeded(activeProject);
+  reconcileProjectJobs(activeProject);
   // Selection khôi phục từ role đã sync server (reload giữ nguyên lựa chọn).
   selectionByProject.set(
     activeProject,
@@ -282,6 +299,7 @@ function showProjectContents() {
   );
   renderResultsGrid();
   renderComposerRefs();
+  syncSelectionToolbar();
 }
 
 // ── Selection helpers ────────────────────────────────────────────────────
@@ -312,12 +330,14 @@ function selectionChanged() {
   renderResultsGrid();
   renderComposerRefs();
   syncSelectionRoles();
+  syncSelectionToolbar();
 }
 
 // Auto-chọn vmode theo số ảnh đang chọn (giữ combo luôn hợp lệ):
 // 0 ảnh → Text; 1-2 ảnh → Frames (nếu model hỗ trợ); ≥3 → Ingredients.
 function applyVideoVmodeAuto() {
-  if (genState.mode !== 'video' || genState.video.vmode === 'extend') return;
+  if (genState.mode !== 'video') return;
+  if (genState.video.vmode === 'extend') return; // chế độ nối tiếp: không tự đổi
   const model = genSelectedModel('video');
   const count = selectedImageItems().length;
   if (count === 0) {
@@ -355,6 +375,42 @@ function clearSelection() {
   selectionByProject.set(activeProject, []);
   selectionChanged();
 }
+
+// ── Toolbar xóa item đã chọn (marquee selection) ──────────────────────────
+function syncSelectionToolbar() {
+  if (!selectionToolbar) return;
+  const count = selectionIds().length;
+  selectionToolbar.hidden = count === 0;
+  selectionCount.textContent = count ? `Đã chọn ${count} item` : '';
+}
+
+selectionClear.addEventListener('click', () => clearSelection());
+
+selectionDelete.addEventListener('click', async () => {
+  const project = activeProjectData();
+  const items = selectedItems();
+  if (!project || !items.length) return;
+  // Đang có job chạy thì chặn: server đang append results, PATCH giờ sẽ lose data.
+  if (projectRunningCount(project.id) > 0) {
+    showToast('Đang có job tạo nội dung — đợi job xong rồi hãy xóa item.');
+    return;
+  }
+  if (!window.confirm(`Xóa ${items.length} item đã chọn khỏi project?`)) return;
+  const removeIds = new Set(items.map((item) => String(item.id)));
+  const remaining = (project.results ?? []).filter((item) => !removeIds.has(String(item?.id)));
+  try {
+    // Xóa hàng loạt = gửi results đã lọc qua PATCH project (một request duy nhất).
+    const response = await request(projectPath(project.id), {
+      method: 'PATCH',
+      body: JSON.stringify({ results: remaining }),
+    });
+    if (!response.ok) throw new Error('Bulk delete failed');
+    const updated = replaceProjectWith(await response.json());
+    if (updated) showToast(`Đã xóa ${items.length} item.`);
+  } catch {
+    showToast('Không xóa được các item đã chọn.');
+  }
+});
 
 // Selection là nguồn sự thật cho role 'reference': sync ngầm (debounce) để
 // reload trang giữ nguyên lựa chọn. Chỉ PATCH item thật sự đổi role.
@@ -471,6 +527,7 @@ function renderComposerRefs() {
   const usable = Math.min(imageCount, cap);
   const videoLabels = {
     text: `Text mode — ${imageCount} ảnh không dùng`,
+    extend: `Extend — ${imageCount} ảnh không dùng`,
     frames: `Frames ${usable}/2`,
     ingredients: `Ingredients ${usable}/3`,
   };
@@ -585,14 +642,93 @@ function createResultCard(item) {
     card.append(menuButton);
   }
   if (isVideo) {
-    // Inline video keeps its controls; this corner button opens the lightbox.
+    // Nút góc mở video editor; click vùng hình của video cũng mở editor (trừ
+    // khi click trúng controls — xem heuristic media events bên dưới).
     const expand = makeButton('result-expand', '');
-    expand.setAttribute('aria-label', 'Xem lớn');
-    expand.title = 'Xem lớn';
+    expand.setAttribute('aria-label', 'Mở trình chỉnh sửa video');
+    expand.title = 'Mở trình chỉnh sửa video';
     expand.append(expandIcon());
     card.append(expand);
+    // Controls của <video> là shadow DOM — không đánh dấu được click riêng, nên
+    // nghe các media event mà controls phát ra trong 600ms sau pointerdown;
+    // có event (play/pause/seek/âm lượng…) → click vừa rồi là tương tác
+    // controls, không mở editor.
+    let controlsUsed = false;
+    let controlsArmTimer = null;
+    const CONTROL_EVENTS = ['play', 'pause', 'seeking', 'seeked', 'volumechange', 'ratechange'];
+    const markControls = () => { controlsUsed = true; };
+    const clearControlArming = () => {
+      clearTimeout(controlsArmTimer);
+      for (const type of CONTROL_EVENTS) media.removeEventListener(type, markControls);
+    };
+    media.addEventListener('pointerdown', () => {
+      controlsUsed = false;
+      for (const type of CONTROL_EVENTS) media.addEventListener(type, markControls);
+      clearTimeout(controlsArmTimer);
+      controlsArmTimer = setTimeout(clearControlArming, 600);
+    });
+    media.addEventListener('click', (event) => {
+      const used = controlsUsed;
+      clearControlArming();
+      controlsUsed = false;
+      if (used) return; // click trên play/seek/âm lượng… — để controls tự xử
+      event.stopPropagation();
+      if (resultItemInProject(item)) openVideoEditor(item);
+    });
   }
+  // Hover overlay: chỉ còn tên item (hành động đã dồn vào menu ⋯). Tên dài
+  // được cắt bằng CSS ellipsis nên cả tên user tự đặt cũng không phá layout.
+  const overlay = document.createElement('figcaption');
+  overlay.className = 'result-overlay';
+  const label = document.createElement('span');
+  label.className = 'result-name';
+  label.textContent = itemDisplayName(item, isVideo);
+  overlay.append(label);
+  card.append(overlay);
   return card;
+}
+
+function itemDisplayName(item, isVideo) {
+  const name = typeof item.name === 'string' ? item.name.trim() : '';
+  return name || (isVideo ? 'Video' : 'Ảnh');
+}
+
+// "Re use prompt": điền prompt của item vào composer + chọn lại các ảnh tham
+// chiếu lúc generate (chỉ id còn tồn tại trong project, đúng thứ tự trong meta).
+function reuseItemPrompt(item) {
+  // Re-use prompt đè vmode/model → đang nối tiếp thì hủy extend trước.
+  if (genState.video.vmode === 'extend') exitExtendMode();
+  const promptText = typeof item.meta?.prompt === 'string' ? item.meta.prompt.trim() : '';
+  if (!promptText) return;
+  const mode = item.kind === 'video' ? 'video' : 'image';
+  genState.mode = mode;
+  if (mode === 'video') {
+    // Chuyển đúng vmode lúc generate; 'extend' không tái dùng được → về 'text'.
+    const vmode = typeof item.meta?.vmode === 'string' ? item.meta.vmode : 'text';
+    genState.video.vmode = ['text', 'frames', 'ingredients'].includes(vmode) ? vmode : 'text';
+  }
+  // Theo luôn model dùng lúc generate nếu catalog vẫn còn model đó.
+  const modelId = typeof item.meta?.model === 'string' ? item.meta.model : '';
+  if (modelId && optionsFor(mode).models.some((model) => model.id === modelId)) {
+    genState[mode].model = modelId;
+  }
+  applyModelCapability(mode);
+  prompt.value = promptText;
+  // Bắn input để autosave draft + auto-grow textarea chạy đúng đường hiện có.
+  prompt.dispatchEvent(new Event('input'));
+  const liveImageIds = new Set(
+    (activeProjectData()?.results ?? [])
+      .filter((candidate) => candidate?.kind === 'image')
+      .map((candidate) => String(candidate.id)),
+  );
+  clearSelection();
+  const references = Array.isArray(item.meta?.references) ? item.meta.references : [];
+  for (const reference of references) {
+    const id = String(reference);
+    if (liveImageIds.has(id)) setSelected(id, true);
+  }
+  renderGenDialog();
+  showToast('Đã điền lại prompt từ item này.');
 }
 
 function createPendingCard(pending) {
@@ -617,18 +753,28 @@ function renderResultsGrid() {
     return;
   }
   const results = Array.isArray(active.results) ? active.results : [];
-  const pending = pendingByProject.get(active.id);
   const cards = [];
-  if (pending) {
-    // Progressive results claim the pending slots from the front.
-    const partial = (jobResults.get(active.id) ?? []).slice(0, pending.count);
+  // Mỗi job đang chạy (gồm cả POST chưa có job_id) là một nhóm pending riêng;
+  // sắp theo startedAt giảm dần để job mới nhất bên trái. Kết quả partial của
+  // job chiếm slot từ đầu nhóm, spinner lấp phần còn lại cho đủ count.
+  const projectJobs = [...jobsById.values()]
+    .filter((job) => job.projectId === active.id)
+    .sort((a, b) => b.startedAt - a.startedAt);
+  for (const job of projectJobs) {
+    const partial = (Array.isArray(job.partial) ? job.partial : []).slice(0, job.count).reverse();
     for (const item of partial) {
       const card = createResultCard(item);
       if (card) cards.push(card);
     }
-    while (cards.length < pending.count) cards.push(createPendingCard(pending));
+    let filled = Math.min(partial.length, job.count);
+    while (filled < job.count) {
+      cards.push(createPendingCard(job));
+      filled += 1;
+    }
   }
-  for (const item of results) {
+  // Mới nhất luôn ở bên trái: đảo thứ tự lúc render (mới → cũ); thứ tự lưu trong
+  // DB giữ nguyên vì item mới luôn được append vào cuối mảng results.
+  for (const item of [...results].reverse()) {
     const card = createResultCard(item);
     if (card) cards.push(card);
   }
@@ -637,39 +783,111 @@ function renderResultsGrid() {
   resultsEmpty.hidden = cards.length > 0;
 }
 
-// --- Lightbox ---------------------------------------------------------------
+// --- Gallery lightbox (ảnh) --------------------------------------------------
+// Click item ảnh mở gallery duyệt TẤT CẢ ảnh của project active theo thứ tự
+// grid (mới nhất trước). Video KHÔNG vào gallery — click video mở video editor
+// (xem phần Video editor bên dưới).
 
 const lightbox = document.createElement('div');
 lightbox.id = 'lightbox';
 lightbox.className = 'lightbox';
 lightbox.hidden = true;
+lightbox.setAttribute('role', 'dialog');
+lightbox.setAttribute('aria-modal', 'true');
+lightbox.setAttribute('aria-label', 'Xem ảnh');
 document.body.append(lightbox);
 
-function openLightbox(kind, url) {
-  if (!url) return;
-  const isVideo = kind === 'video';
-  const media = document.createElement(isVideo ? 'video' : 'img');
-  media.className = isVideo ? 'lightbox-video' : 'lightbox-img';
-  if (isVideo) {
-    media.controls = true;
-    media.preload = 'metadata';
-  } else {
-    media.alt = '';
+// State gallery: ảnh theo đúng thứ tự grid + index ảnh đang mở.
+let galleryState = null; // { items: [item], index }
+
+function galleryImages() {
+  const project = activeProjectData();
+  return (Array.isArray(project?.results) ? project.results : [])
+    .filter((item) => item?.kind === 'image' && typeof item.url === 'string' && item.url)
+    .reverse();
+}
+
+// DOM gallery dựng một lần, nội dung cập nhật theo galleryState.
+const lightboxImg = document.createElement('img');
+lightboxImg.className = 'lightbox-img';
+lightboxImg.alt = '';
+const lightboxTitle = document.createElement('span');
+lightboxTitle.className = 'lightbox-title';
+const lightboxMeta = document.createElement('span');
+lightboxMeta.className = 'lightbox-meta';
+const lightboxDownload = makeButton('lightbox-btn', 'Download');
+lightboxDownload.setAttribute('aria-label', 'Tải ảnh này xuống');
+lightboxDownload.addEventListener('click', () => {
+  const item = galleryState?.items[galleryState.index];
+  if (item) downloadItem(item);
+});
+const lightboxClose = makeButton('lightbox-close', '×');
+lightboxClose.setAttribute('aria-label', 'Đóng');
+lightboxClose.addEventListener('click', closeLightbox);
+const lightboxHead = document.createElement('div');
+lightboxHead.className = 'lightbox-head';
+lightboxHead.append(lightboxTitle, lightboxMeta, lightboxDownload, lightboxClose);
+const lightboxPrev = makeButton('lightbox-nav lightbox-prev', '‹');
+lightboxPrev.setAttribute('aria-label', 'Ảnh mới hơn (trước)');
+lightboxPrev.addEventListener('click', () => galleryShift(-1));
+const lightboxNext = makeButton('lightbox-nav lightbox-next', '›');
+lightboxNext.setAttribute('aria-label', 'Ảnh cũ hơn (tiếp)');
+lightboxNext.addEventListener('click', () => galleryShift(1));
+lightbox.append(lightboxHead, lightboxImg, lightboxPrev, lightboxNext);
+
+function renderGallery() {
+  const state = galleryState;
+  if (!state || !state.items.length) {
+    closeLightbox();
+    return;
   }
-  media.src = url;
-  const closeButton = makeButton('lightbox-close', '×');
-  closeButton.setAttribute('aria-label', 'Đóng');
-  closeButton.addEventListener('click', closeLightbox);
-  lightbox.replaceChildren(media, closeButton);
+  state.index = Math.min(Math.max(state.index, 0), state.items.length - 1);
+  const item = state.items[state.index];
+  const res = typeof item.meta?.res === 'string' && item.meta.res ? item.meta.res : '';
+  // Kích thước pixel thật chỉ có sau khi ảnh decode xong; trước đó hiện "…".
+  const syncMeta = () => {
+    if (lightboxImg.naturalWidth > 0 && lightboxImg.naturalHeight > 0) {
+      lightboxMeta.textContent = [res, `${lightboxImg.naturalWidth}×${lightboxImg.naturalHeight}`]
+        .filter(Boolean)
+        .join(' · ');
+    }
+  };
+  lightboxImg.onload = syncMeta;
+  lightboxImg.src = item.url;
+  if (lightboxImg.complete) syncMeta(); // ảnh đã cache: onload có thể không fire lại
+  lightboxTitle.textContent = itemDisplayName(item, false);
+  lightboxTitle.title = lightboxTitle.textContent;
+  lightboxPrev.disabled = state.index === 0;
+  lightboxNext.disabled = state.index === state.items.length - 1;
+}
+
+function galleryShift(delta) {
+  if (!galleryState) return;
+  const next = galleryState.index + delta;
+  if (next < 0 || next >= galleryState.items.length) return;
+  galleryState.index = next;
+  renderGallery();
+}
+
+function openGalleryForItem(item) {
+  if (!item) return;
+  const items = galleryImages();
+  if (!items.length) return;
+  const index = items.findIndex((candidate) => String(candidate?.id) === String(item.id));
+  if (index < 0) return; // card không nằm trong danh sách ảnh (url rỗng…) → không mở
+  galleryState = { items, index };
+  renderGallery();
   lightbox.hidden = false;
-  closeButton.focus();
+  lightboxClose.focus();
 }
 
 function closeLightbox() {
   if (lightbox.hidden) return;
   lightbox.hidden = true;
-  // Dropping the media node stops video playback right away.
-  lightbox.replaceChildren();
+  galleryState = null;
+  // Nhả src + bỏ onload để hủy decode ảnh đang treo.
+  lightboxImg.removeAttribute('src');
+  lightboxImg.onload = null;
 }
 
 lightbox.addEventListener('click', (event) => {
@@ -677,13 +895,21 @@ lightbox.addEventListener('click', (event) => {
   if (event.composedPath()[0] === lightbox) closeLightbox();
 });
 
+// Item hoàn thật sự nằm trong project.results (loại card pending/partial của
+// job đang chạy — những card đó KHÔNG mở được gallery/editor).
+function resultItemInProject(item) {
+  const project = activeProjectData();
+  if (!project || !item) return null;
+  return (project.results ?? []).find((candidate) => String(candidate?.id) === String(item.id)) ?? null;
+}
+
 resultsGrid.addEventListener('click', (event) => {
   const path = event.composedPath();
   const card = path.find(
     (node) => node instanceof Element && node.classList.contains('result-card') && !node.classList.contains('is-pending')
   );
   if (!card) return;
-  // Ctrl/Cmd + click = toggle chọn item làm tham chiếu (không mở lightbox).
+  // Ctrl/Cmd + click = toggle chọn item làm tham chiếu (không mở gallery/editor).
   if (event.ctrlKey || event.metaKey) {
     const resultId = card.dataset.resultId;
     if (resultId) {
@@ -694,11 +920,310 @@ resultsGrid.addEventListener('click', (event) => {
   }
   const media = card.querySelector('img, video');
   if (!media) return;
+  const resultId = card.dataset.resultId;
+  const item = resultId ? resultItemInProject({ id: resultId }) : null;
+  if (!item) return; // pending/partial: chỉ item hoàn tất mới mở được
   const onExpand = path.some((node) => node instanceof Element && node.classList.contains('result-expand'));
-  // Inline video owns its own clicks; only the expand button opens the lightbox.
-  if (media.tagName === 'VIDEO' && !onExpand) return;
-  openLightbox(media.tagName === 'VIDEO' ? 'video' : 'image', media.getAttribute('src'));
+  // Inline video owns its own clicks: click vùng hình tự mở editor từ listener
+  // trong createResultCard; ở đây chỉ nút expand mở editor. Ảnh mở gallery.
+  if (media.tagName === 'VIDEO') {
+    if (onExpand) openVideoEditor(item);
+    return;
+  }
+  openGalleryForItem(item);
 });
+
+// ── Video editor modal (trim + extend) ──────────────────────────────────────
+// Mở khi click item video hoàn tất (vùng hình hoặc nút expand góc). Trim: kéo
+// 2 handle đặt [start, end) giữ lại → POST /items/{id}/trim → 201 item mới →
+// merge vào project.results local (pattern mergeJobResults) + render. Extend:
+// đóng editor và bật chế độ nối tiếp trên composer (vmode 'extend').
+
+const videoEditor = document.querySelector('#video-editor');
+const videoEditorTitle = document.querySelector('#video-editor-title');
+const videoEditorPlayer = document.querySelector('#video-editor-player');
+const videoEditorClose = document.querySelector('#video-editor-close');
+const trimTrack = document.querySelector('#trim-track');
+const trimRange = document.querySelector('#trim-range');
+const trimHandleStart = document.querySelector('#trim-handle-start');
+const trimHandleEnd = document.querySelector('#trim-handle-end');
+const trimStartLabel = document.querySelector('#trim-start-label');
+const trimDurationLabel = document.querySelector('#trim-duration-label');
+const trimEndLabel = document.querySelector('#trim-end-label');
+const videoEditorExtend = document.querySelector('#video-editor-extend');
+const videoEditorTrimSave = document.querySelector('#video-editor-trim-save');
+
+// Chip "Nối tiếp" nổi trên composer khi đang ở chế độ extend.
+const extendChip = document.querySelector('#extend-chip');
+const extendChipLabel = document.querySelector('#extend-chip-label');
+const extendChipCancel = document.querySelector('#extend-chip-cancel');
+
+// Mirror TRIM_MIN_DURATION_SEC backend: đoạn giữ lại tối thiểu 0.2s.
+const TRIM_MIN_SEC = 0.2;
+
+let trimState = null; // { item, projectId, duration, start, end, saving, dragging }
+let extendState = null; // { itemId, model, ratio, name } — video đang nối tiếp
+
+// Label hiển thị của 1 model id trong catalog; không thấy → null (caller tự
+// fallback sang id gốc dạng text).
+function modelLabelForId(mode, modelId) {
+  return optionsFor(mode).models.find((model) => model.id === modelId)?.label ?? null;
+}
+
+function fmtClock(sec) {
+  if (!Number.isFinite(sec)) return '–:––';
+  const total = Math.floor(Math.max(0, sec));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+}
+
+// Giá trị trim thực sự gửi server (3 số thập phân — khớp độ chính xác -ss/-t
+// của ffmpeg). Validate trên giá trị ĐÃ round để không xảy ra client-pass mà
+// server 400 do sai số float (vd 0.199999…).
+function roundedTrimRange() {
+  if (!trimState) return null;
+  return {
+    start: Math.round(trimState.start * 1000) / 1000,
+    end: Math.round(trimState.end * 1000) / 1000,
+  };
+}
+
+function trimRangeValid() {
+  if (!trimState) return false;
+  const { duration } = trimState;
+  if (!Number.isFinite(duration) || duration <= 0) return false;
+  const { start, end } = roundedTrimRange();
+  if (!(start >= 0)) return false;
+  // Dung sai +0.0005s cho end: round 3 số có thể đẩy end (== duration lẻ như
+  // 7.999999…) vượt lên 0.0005 — vẫn dưới tolerance +0.5s của server.
+  if (!(end <= duration + 0.0005)) return false;
+  return end - start >= TRIM_MIN_SEC;
+}
+
+function renderTrimTimeline() {
+  const state = trimState;
+  if (!state) return;
+  const dur = state.duration;
+  const metadataOk = Number.isFinite(dur) && dur > 0;
+  const pct = (sec) => (metadataOk ? `${Math.min(100, Math.max(0, (sec / dur) * 100))}%` : '0%');
+  trimRange.style.left = pct(state.start);
+  trimRange.style.width = metadataOk
+    ? `${Math.min(100, Math.max(0, ((state.end - state.start) / dur) * 100))}%`
+    : '0%';
+  trimHandleStart.style.left = pct(state.start);
+  trimHandleEnd.style.left = pct(state.end);
+  trimHandleStart.disabled = !metadataOk;
+  trimHandleEnd.disabled = !metadataOk;
+  trimStartLabel.textContent = fmtClock(state.start);
+  trimEndLabel.textContent = fmtClock(state.end);
+  trimDurationLabel.textContent = fmtClock(dur);
+  videoEditorTrimSave.disabled = state.saving || !trimRangeValid();
+}
+
+// Điều kiện Extend của 1 item: phải biết model + ratio lúc generate, và ratio
+// thuộc 2 tỉ lệ upstream hỗ trợ cho extend (16:9 landscape / 9:16 portrait).
+function extendCapabilityFor(item) {
+  const ratio = typeof item?.meta?.ratio === 'string' ? item.meta.ratio : '';
+  const model = typeof item?.meta?.model === 'string' ? item.meta.model : '';
+  if (!ratio || !model) {
+    return { ok: false, reason: 'Video này thiếu thông tin model/tỉ lệ — không thể extend.' };
+  }
+  if (ratio !== '16:9' && ratio !== '9:16') {
+    return { ok: false, reason: 'Extend chỉ hỗ trợ tỉ lệ 16:9/9:16.' };
+  }
+  return { ok: true, reason: '' };
+}
+
+function openVideoEditor(item) {
+  if (!item || item.kind !== 'video' || typeof item.url !== 'string' || !activeProject) return;
+  trimState = {
+    item,
+    projectId: activeProject,
+    duration: Number.NaN,
+    start: 0,
+    end: 0,
+    saving: false,
+    dragging: null,
+  };
+  videoEditorTitle.textContent = itemDisplayName(item, true);
+  videoEditorTitle.title = videoEditorTitle.textContent;
+  const capability = extendCapabilityFor(item);
+  videoEditorExtend.disabled = !capability.ok;
+  videoEditorExtend.title = capability.ok ? 'Tạo video nối tiếp từ video này' : capability.reason;
+  renderTrimTimeline(); // duration chưa có → handle disable + nút lưu disable
+  videoEditor.hidden = false;
+  videoEditorClose.focus();
+}
+
+function closeVideoEditor() {
+  if (videoEditor.hidden) return;
+  videoEditor.hidden = true;
+  trimState = null;
+  // Nhả src để dừng playback + giải phóng buffer; mở lại sẽ gắn src mới.
+  videoEditorPlayer.removeAttribute('src');
+  videoEditorPlayer.load();
+}
+
+videoEditorClose.addEventListener('click', closeVideoEditor);
+videoEditor.addEventListener('click', (event) => {
+  // Click nền (không trúng card) đóng editor — same pattern với item-dialog.
+  if (event.composedPath()[0] === videoEditor) closeVideoEditor();
+});
+
+videoEditorPlayer.addEventListener('loadedmetadata', () => {
+  if (!trimState) return;
+  const duration = videoEditorPlayer.duration;
+  if (Number.isFinite(duration) && duration > 0) {
+    trimState.duration = duration;
+    trimState.start = 0;
+    trimState.end = duration;
+  }
+  renderTrimTimeline(); // duration NaN (metadata lỗi) → mọi thứ vẫn disable
+});
+
+// Timeline: 2 handle kéo bằng pointer events; kéo bị chặn biên [0, duration]
+// và khoảng cách tối thiểu TRIM_MIN_SEC giữa 2 đầu (range sai → nút lưu disable).
+function trimPointerSec(event) {
+  const rect = trimTrack.getBoundingClientRect();
+  const ratio = rect.width > 0 ? (event.clientX - rect.left) / rect.width : 0;
+  return Math.min(1, Math.max(0, ratio)) * (trimState?.duration ?? Number.NaN);
+}
+
+function trimHandlePointerDown(kind) {
+  return (event) => {
+    if (!trimState || trimState.dragging || !Number.isFinite(trimState.duration)) return;
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    event.preventDefault();
+    trimState.dragging = kind;
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+}
+
+function trimHandlePointerMove(kind) {
+  return (event) => {
+    if (!trimState || trimState.dragging !== kind) return;
+    const sec = trimPointerSec(event);
+    if (!Number.isFinite(sec)) return;
+    if (kind === 'start') {
+      trimState.start = Math.min(Math.max(sec, 0), trimState.end - TRIM_MIN_SEC);
+    } else {
+      trimState.end = Math.min(Math.max(sec, trimState.start + TRIM_MIN_SEC), trimState.duration);
+    }
+    renderTrimTimeline();
+  };
+}
+
+function trimHandlePointerUp() {
+  if (trimState) trimState.dragging = null;
+}
+
+trimHandleStart.addEventListener('pointerdown', trimHandlePointerDown('start'));
+trimHandleEnd.addEventListener('pointerdown', trimHandlePointerDown('end'));
+trimHandleStart.addEventListener('pointermove', trimHandlePointerMove('start'));
+trimHandleEnd.addEventListener('pointermove', trimHandlePointerMove('end'));
+for (const type of ['pointerup', 'pointercancel']) {
+  trimHandleStart.addEventListener(type, trimHandlePointerUp);
+  trimHandleEnd.addEventListener(type, trimHandlePointerUp);
+}
+
+// Bàn phím cho handle: ←/→ nudge ±0.1s (Shift ±1s) — điều chỉnh mịn sau khi kéo.
+function nudgeTrim(kind, delta) {
+  if (!trimState || !Number.isFinite(trimState.duration) || trimState.saving) return;
+  if (kind === 'start') {
+    trimState.start = Math.min(Math.max(trimState.start + delta, 0), trimState.end - TRIM_MIN_SEC);
+  } else {
+    trimState.end = Math.min(Math.max(trimState.end + delta, trimState.start + TRIM_MIN_SEC), trimState.duration);
+  }
+  renderTrimTimeline();
+}
+
+for (const [handle, kind] of [[trimHandleStart, 'start'], [trimHandleEnd, 'end']]) {
+  handle.addEventListener('keydown', (event) => {
+    const step = event.shiftKey ? 1 : 0.1;
+    if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      event.stopPropagation();
+      nudgeTrim(kind, -step);
+    } else if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      event.stopPropagation();
+      nudgeTrim(kind, step);
+    }
+  });
+}
+
+// POST trim → 201 item mới: server đã append vào project, frontend chỉ mirror
+// vào bản local + render. Lỗi 400/404/500 → toast detail, editor giữ nguyên.
+videoEditorTrimSave.addEventListener('click', async () => {
+  const state = trimState;
+  if (!state || state.saving || !trimRangeValid()) return;
+  state.saving = true;
+  videoEditorTrimSave.disabled = true;
+  const { start, end } = roundedTrimRange();
+  try {
+    const response = await request(
+      projectPath(state.projectId, `/items/${encodeURIComponent(String(state.item.id))}/trim`),
+      { method: 'POST', body: JSON.stringify({ start_sec: start, end_sec: end }) },
+    );
+    if (response.status === 401) {
+      setSignedIn(false);
+      return;
+    }
+    if (!response.ok) {
+      showToast((await responseErrorMessage(response)) || 'Không cắt được video.');
+      return;
+    }
+    const item = await response.json();
+    mergeJobResults(state.projectId, [item]);
+    if (state.projectId === activeProject) renderResultsGrid();
+    showToast('Đã tạo bản trim.');
+    closeVideoEditor();
+  } catch {
+    showToast('Không cắt được video.');
+  } finally {
+    if (trimState === state) {
+      state.saving = false;
+      videoEditorTrimSave.disabled = !trimRangeValid();
+    }
+  }
+});
+
+// ── Chế độ Extend trên composer (nối tiếp video) ────────────────────────────
+
+function enterExtendMode(item) {
+  extendState = {
+    itemId: String(item.id),
+    model: String(item.meta.model),
+    ratio: String(item.meta.ratio),
+    name: itemDisplayName(item, true),
+  };
+  genState.mode = 'video';
+  genState.video.vmode = 'extend';
+  genState.video.qty = 1; // backend: extend chỉ 1 kết quả mỗi lần
+  genModelListOpen = false;
+  extendChipLabel.textContent = `Nối tiếp: ${extendState.name}`;
+  extendChip.hidden = false;
+  renderGenDialog();
+  renderComposerRefs();
+  prompt.focus();
+}
+
+function exitExtendMode() {
+  if (!extendState && genState.video.vmode !== 'extend') return;
+  extendState = null;
+  genState.video.vmode = 'text';
+  extendChip.hidden = true;
+  renderGenDialog();
+  renderComposerRefs();
+}
+
+videoEditorExtend.addEventListener('click', () => {
+  const item = trimState?.item;
+  if (!item || !extendCapabilityFor(item).ok) return;
+  enterExtendMode(item);
+  closeVideoEditor();
+});
+
+extendChipCancel.addEventListener('click', () => exitExtendMode());
 
 // ── Marquee selection (bôi vuông chọn item trong stage) ──────────────────
 // Kéo chuột trái trên stage vẽ khung; thả ra → chọn mọi card giao khung.
@@ -831,119 +1356,306 @@ window.addEventListener('pointerup', onStagePointerUp);
 stage.addEventListener('dragstart', (event) => event.preventDefault());
 
 // --- Generate job engine ----------------------------------------------------
+// Mỗi job là một entry trong jobsById (khoá theo jobId); poller riêng cho từng
+// job trong timersByJob. Nguồn sự thật lúc poll/reconcile là GET /jobs của
+// project (contract backend): {"jobs": [{job_id, status, error, results, created_at}]}.
 
-function stopPolling(projectId) {
-  const timer = jobTimers.get(projectId);
+function stopPolling(jobId) {
+  const timer = timersByJob.get(jobId);
   if (timer) clearInterval(timer);
-  jobTimers.delete(projectId);
+  timersByJob.delete(jobId);
 }
 
-function clearJobState(projectId) {
-  submitting.delete(projectId);
-  activeJobs.delete(projectId);
-  stopPolling(projectId);
-  pendingByProject.delete(projectId);
-  jobResults.delete(projectId);
-}
-
-function startPolling(projectId, jobId) {
-  stopPolling(projectId);
-  const timer = setInterval(() => { pollJob(projectId, jobId); }, 1500);
-  jobTimers.set(projectId, timer);
+function startPolling(jobId) {
+  stopPolling(jobId);
+  const timer = setInterval(() => { pollJob(jobId); }, 1500);
+  timersByJob.set(jobId, timer);
 }
 
 function resumePollingIfNeeded(projectId) {
-  // A job keeps running server-side across project switches; resume its poll
-  // when its project becomes active again and no interval is tracking it.
-  if (!projectId || !activeJobs.has(projectId) || jobTimers.has(projectId)) return;
-  startPolling(projectId, activeJobs.get(projectId));
+  // Job sống qua đổi project: khi project trở lại active mà chưa có poller nào
+  // theo dõi thì dựng lại interval (sau F5 thì reconcileProjectJobs lo).
+  if (!projectId) return;
+  for (const [jobId, job] of jobsById) {
+    if (job.projectId !== projectId || jobId.startsWith('tmp:')) continue;
+    if (!timersByJob.has(jobId)) startPolling(jobId);
+  }
+}
+
+function persistJobQueue() {
+  // Mirror queue vào localStorage: chỉ job thật (đã có job_id từ server) —
+  // entry tmp:* đang POST chưa chắc tồn tại nên không lưu.
+  const entries = [...jobsById.values()]
+    .filter((job) => !String(job.jobId).startsWith('tmp:'))
+    .map(({ projectId, jobId, mode, ratio, count, startedAt }) => ({
+      projectId, jobId, mode, ratio, count, startedAt,
+    }));
+  try { localStorage.setItem(JOB_QUEUE_KEY, JSON.stringify(entries)); } catch { /* Storage may be unavailable. */ }
+}
+
+function loadJobQueue() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(JOB_QUEUE_KEY) ?? '[]');
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((entry) => entry
+      && typeof entry.jobId === 'string' && entry.jobId
+      && typeof entry.projectId === 'string' && entry.projectId
+      && typeof entry.mode === 'string');
+  } catch {
+    return []; // Storage hỏng/thiếu — coi như queue rỗng, reconcile sẽ dựng lại.
+  }
+}
+
+function removeJob(jobId) {
+  jobsById.delete(jobId);
+  stopPolling(jobId);
+  persistJobQueue();
+}
+
+function clearProjectJobs(projectId) {
+  for (const [jobId, job] of [...jobsById]) {
+    if (job.projectId === projectId) removeJob(jobId);
+  }
+}
+
+function clearAllJobsLocal() {
+  // Chỉ dọn in-memory (logout/session hết hạn); queue localStorage giữ nguyên —
+  // sign-in lại hoặc F5 sẽ reconcile theo server và khôi phục pending card.
+  for (const jobId of [...timersByJob.keys()]) stopPolling(jobId);
+  jobsById.clear();
 }
 
 // Video jobs can run for minutes; no stop shorter than the contract's 10 minutes.
 const JOB_MAX_WAIT_MS = 20 * 60 * 1000;
 
-async function pollJob(projectId, jobId) {
-  const pending = pendingByProject.get(projectId);
-  if (pending && Date.now() - pending.startedAt > JOB_MAX_WAIT_MS) {
-    failJob(projectId, 'Hết thời gian chờ tạo nội dung.');
-    return;
-  }
-  let data = null;
-  try {
-    const response = await request(projectPath(projectId, `/generate/${encodeURIComponent(jobId)}`));
-    if (response.status === 401) {
-      // Session hết hạn giữa chừng: poll thêm cũng vô ích — đưa về key screen
-      // giống POST path thay vì chờ hết 20 phút rồi báo sai "hết thời gian".
-      stopPolling(projectId);
-      setSignedIn(false);
-      return;
+async function fetchProjectJobs(projectId) {
+  // GET /jobs theo contract backend; dedupe request đang bay giữa các poller
+  // của cùng project để N job không sinh ra N request cùng lúc.
+  const inFlight = jobsFetchInFlight.get(projectId);
+  if (inFlight) return inFlight;
+  const promise = (async () => {
+    try {
+      const response = await request(projectPath(projectId, '/jobs'));
+      if (response.status === 401) return { unauthorized: true, jobs: [] };
+      if (!response.ok) return null;
+      const data = await response.json();
+      return { jobs: Array.isArray(data?.jobs) ? data.jobs : [] };
+    } catch {
+      return null; // network hiccup: caller keeps polling
+    } finally {
+      jobsFetchInFlight.delete(projectId);
     }
-    if (!response.ok) return; // transient failure: keep polling
-    data = await response.json();
-  } catch {
-    return; // network hiccup: keep polling
-  }
-  if (data?.status === 'done') {
-    finishJob(projectId, Array.isArray(data.results) ? data.results : []);
+  })();
+  jobsFetchInFlight.set(projectId, promise);
+  return promise;
+}
+
+async function pollJob(jobId) {
+  const job = jobsById.get(jobId);
+  if (!job) {
+    stopPolling(jobId);
     return;
   }
-  if (data?.status === 'error') {
-    failJob(projectId, data.error);
+  if (Date.now() - job.startedAt > JOB_MAX_WAIT_MS) {
+    failJob(jobId, 'Hết thời gian chờ tạo nội dung.');
     return;
   }
-  // Still running: adopt partial results early when the backend streams them.
-  if (Array.isArray(data?.results) && data.results.length) {
-    jobResults.set(projectId, data.results);
-    if (projectId === activeProject) renderResultsGrid();
+  const data = await fetchProjectJobs(job.projectId);
+  if (!data) return; // transient failure: keep polling
+  if (data.unauthorized) {
+    // Session hết hạn giữa chừng: poll thêm cũng vô ích — về key screen
+    // thay vì chờ hết 20 phút rồi báo sai "hết thời gian".
+    clearAllJobsLocal();
+    setSignedIn(false);
+    return;
+  }
+  reconcileJobsFromList(job.projectId, data.jobs, { live: true });
+}
+
+// Không toast rời rạc khi merge kết quả cũ lúc load — gộp 1 toast sau debounce.
+let loadMergedCount = 0;
+let loadMergedTimer = null;
+
+function noteLoadMerge(count) {
+  if (!count) return;
+  loadMergedCount += count;
+  clearTimeout(loadMergedTimer);
+  loadMergedTimer = setTimeout(() => {
+    const total = loadMergedCount;
+    loadMergedCount = 0;
+    if (total > 0) showToast(`Đã nạp ${total} kết quả mới từ các job đã xong.`);
+  }, 800);
+}
+
+function guessJobEntry(projectId, jobId, server, results) {
+  // Job running trên server nhưng không có trong queue (tab/device khác hoặc
+  // storage mất): dựng entry từ dữ liệu liệt kê để vẫn hiện pending card.
+  const mode = results.some((item) => item?.kind === 'video') ? 'video' : 'image';
+  const first = results.find((item) => typeof item?.meta?.ratio === 'string') ?? null;
+  const ratio = typeof first?.meta?.ratio === 'string' && /^\d+:\d+$/.test(first.meta.ratio)
+    ? first.meta.ratio
+    : mode === 'video' ? '16:9' : '1:1';
+  return {
+    projectId,
+    jobId,
+    mode,
+    ratio,
+    count: Math.max(results.length, 1),
+    startedAt: typeof server.created_at === 'number' ? server.created_at : Date.now(),
+  };
+}
+
+function reconcileJobsFromList(projectId, serverJobs, { live = false } = {}) {
+  const serverById = new Map();
+  for (const entry of serverJobs) {
+    if (entry && typeof entry.job_id === 'string') serverById.set(entry.job_id, entry);
+  }
+  let gridDirty = false;
+  for (const [jobId, job] of [...jobsById]) {
+    if (job.projectId !== projectId || jobId.startsWith('tmp:')) continue;
+    const server = serverById.get(jobId);
+    if (!server) continue; // chưa thấy trong danh sách — giữ nguyên chờ poll sau
+    if (server.status === 'done') {
+      const outcome = finishJob(jobId, Array.isArray(server.results) ? server.results : []);
+      if (outcome) {
+        if (live) {
+          const noun = outcome.mode === 'video' ? 'video' : 'ảnh';
+          if (outcome.created < outcome.count) {
+            showToast(`Đã tạo ${outcome.created}/${outcome.count} ${noun} thành công.`);
+          } else {
+            showToast(`Đã tạo ${outcome.created} ${noun}.`);
+          }
+        } else {
+          noteLoadMerge(outcome.merged); // load: gộp 1 toast, không toast từng job
+        }
+        gridDirty = true;
+      }
+    } else if (server.status === 'error') {
+      // Job lỗi lúc load là job lỗi lâu rồi — bỏ qua im lặng; đang live thì báo.
+      failJob(jobId, live ? (server.error || 'Không tạo được nội dung.') : null);
+      gridDirty = true;
+    } else if (server.status === 'running') {
+      // Still running: adopt partial results early when the backend streams them.
+      const results = Array.isArray(server.results) ? server.results : [];
+      const prev = Array.isArray(job.partial) ? job.partial : [];
+      if (results.length !== prev.length) gridDirty = true;
+      job.partial = results;
+      if (!timersByJob.has(jobId)) {
+        startPolling(jobId);
+        gridDirty = true;
+      }
+    }
+  }
+  if (!live) {
+    // Lượt reconcile lúc load/đổi project: track thêm job running chưa có trong
+    // jobsById — ưu tiên metadata từ queue localStorage (đúng mode/count/ratio
+    // lúc gửi), thiếu thì đoán từ results. Entry done/error còn trong queue là
+    // job xong lúc trang đóng: merge tĩnh (dedupe theo id) + dọn khỏi queue.
+    const queueEntries = new Map(loadJobQueue().map((entry) => [entry.jobId, entry]));
+    // POST đang bay cho project này thì job của nó sẽ có entry thật khi POST
+    // trả job_id — adopt bây giờ sẽ sinh pending card trùng, nên bỏ qua lượt này.
+    const hasInFlightPost = [...jobsById.values()].some(
+      (job) => job.projectId === projectId && String(job.jobId).startsWith('tmp:'),
+    );
+    for (const [serverId, server] of serverById) {
+      if (jobsById.has(serverId)) continue;
+      const results = Array.isArray(server.results) ? server.results : [];
+      if (server.status === 'running') {
+        if (hasInFlightPost) continue; // chỉ bỏ qua adopt running — done/error vẫn dọn queue
+        const queued = queueEntries.get(serverId);
+        const entry = queued ?? guessJobEntry(projectId, serverId, server, results);
+        jobsById.set(serverId, {
+          ...entry,
+          count: Math.max(1, Number(entry.count) || 1),
+          startedAt: Number(entry.startedAt) || Date.now(),
+          partial: results,
+        });
+        startPolling(serverId);
+        gridDirty = true;
+      } else if (queueEntries.has(serverId)) {
+        const merged = mergeJobResults(projectId, results);
+        if (merged) noteLoadMerge(merged);
+      }
+    }
+    // Mirror hiện trạng: entry stale (done/error/project đã xóa) rơi khỏi queue.
+    persistJobQueue();
+  }
+  if (gridDirty && projectId === activeProject) renderResultsGrid();
+}
+
+async function reconcileProjectJobs(projectId) {
+  // Gọi sau sign-in + nạp projects và mỗi lần đổi project active.
+  if (!projectId) return;
+  const data = await fetchProjectJobs(projectId);
+  if (!data) return;
+  if (data.unauthorized) {
+    clearAllJobsLocal();
+    setSignedIn(false);
+    return;
+  }
+  reconcileJobsFromList(projectId, data.jobs, { live: false });
+}
+
+function reconcileQueuedProjects() {
+  // Sau sign-in: mọi project còn job trong queue localStorage đều được đối chiếu.
+  for (const projectId of new Set(loadJobQueue().map((entry) => entry.projectId))) {
+    reconcileProjectJobs(projectId);
   }
 }
 
 function mergeJobResults(projectId, results) {
   const project = projects.find(({ id }) => id === projectId);
-  if (!project || !Array.isArray(results) || !results.length) return;
+  if (!project || !Array.isArray(results) || !results.length) return 0;
   const existing = Array.isArray(project.results) ? project.results : [];
   const seen = new Set(existing.map((item) => item?.id).filter((id) => id !== undefined && id !== null));
-  project.results = [...existing, ...results.filter((item) => item?.id === undefined || item?.id === null || !seen.has(item.id))];
+  const fresh = results.filter((item) => item?.id === undefined || item?.id === null || !seen.has(item.id));
+  if (!fresh.length) return 0;
+  project.results = [...existing, ...fresh];
   project.updated_at = new Date().toISOString();
   sortProjects();
   renderProjects();
+  return fresh.length;
 }
 
-function finishJob(projectId, results) {
-  const pending = pendingByProject.get(projectId);
+function finishJob(jobId, results) {
+  const job = jobsById.get(jobId);
+  if (!job) return null;
   const created = Array.isArray(results) ? results.length : 0;
-  clearJobState(projectId);
-  // The server already appended these results; mirror them into the local copy.
-  mergeJobResults(projectId, results);
-  if (projectId === activeProject) {
+  removeJob(jobId);
+  // Server đã append results; mirror vào bản copy local (dedupe theo id nên an
+  // toàn kể cả khi results đã nằm sẵn trong project sau F5).
+  const merged = mergeJobResults(job.projectId, results);
+  if (job.projectId === activeProject) {
     renderResultsGrid();
   }
-  syncComposerState();
-  const noun = pending?.mode === 'video' ? 'video' : 'ảnh';
-  if (pending && created < pending.count) {
-    showToast(`Đã tạo ${created}/${pending.count} ${noun} thành công.`);
-  } else {
-    showToast(`Đã tạo ${created} ${noun}.`);
-  }
+  return { created, merged, mode: job.mode, count: job.count };
 }
 
-function failJob(projectId, message) {
-  clearJobState(projectId);
-  if (projectId === activeProject) renderResultsGrid();
-  syncComposerState();
-  showToast(message || 'Không tạo được nội dung.');
+function failJob(jobId, message) {
+  const job = jobsById.get(jobId);
+  if (!job) return;
+  removeJob(jobId);
+  if (job.projectId === activeProject) renderResultsGrid();
+  if (message) showToast(message);
 }
 
-function showError(message = '', invalidKey = false) {
+function showError(message = '', invalidField = null) {
   loginError.hidden = !message;
   loginError.textContent = message;
-  if (invalidKey) {
-    keyInput.setAttribute('aria-invalid', 'true');
-    keyInput.setAttribute('aria-describedby', 'login-error');
-  } else {
-    keyInput.removeAttribute('aria-invalid');
-    keyInput.removeAttribute('aria-describedby');
+  for (const input of [urlInput, keyInput]) {
+    if (invalidField && input === (invalidField === 'url' ? urlInput : keyInput)) {
+      input.setAttribute('aria-invalid', 'true');
+      input.setAttribute('aria-describedby', 'login-error');
+    } else {
+      input.removeAttribute('aria-invalid');
+      input.removeAttribute('aria-describedby');
+    }
   }
+}
+
+function focusLoginField() {
+  // Ưu tiên ô còn trống — URL thường được giữ lại sau lần đăng nhập trước.
+  (!urlInput.value ? urlInput : keyInput).focus();
 }
 
 function setSignedIn(signedIn) {
@@ -951,13 +1663,17 @@ function setSignedIn(signedIn) {
   workspace.hidden = !signedIn;
   logout.hidden = !signedIn;
   wmSettingsButton.hidden = !signedIn;
+  densityPicker.hidden = !signedIn;
   if (signedIn) {
     prompt.focus();
   } else {
     projects = [];
     activeProject = null;
-    for (const projectId of [...activeJobs.keys(), ...submitting]) clearJobState(projectId);
+    clearAllJobsLocal(); // giữ queue localStorage — sign-in lại sẽ reconcile tiếp
     closeProjectActions();
+    closeVideoEditor();
+    closeLightbox();
+    exitExtendMode();
     renderProjects();
     showProjectContents();
     sidebarToggle.setAttribute('aria-expanded', 'false');
@@ -971,6 +1687,8 @@ async function restoreSession() {
     setSignedIn(true);
     await loadProjects();
     loadGenOptions();
+    // Khôi phục queue job qua F5: mọi project còn entry trong localStorage.
+    reconcileQueuedProjects();
   } catch {
     // Leave the key-entry screen available while offline.
   }
@@ -979,40 +1697,58 @@ async function restoreSession() {
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
   if (loginButton.disabled) return;
+  const apiUrl = urlInput.value.trim().replace(/\/+$/, '');
   const key = keyInput.value.trim();
+  if (!/^https?:\/\/[^\s]+/i.test(apiUrl)) {
+    showError('API URL must start with http:// or https://.', 'url');
+    return;
+  }
   if (!key || /[^\x21-\x7e]/.test(key)) {
-    showError('API key không hợp lệ.', true);
+    showError('Invalid API key.', 'key');
     return;
   }
   showError();
   loginButton.disabled = true;
+  urlInput.readOnly = true;
   keyInput.readOnly = true;
-  loginButton.textContent = 'Đang xác thực…';
+  loginButton.textContent = 'Verifying…';
   try {
+    // Endpoint + key được server kiểm tra cùng lúc với endpoint đã nhập —
+    // đúng cả hai mới cấp session.
     const response = await request('/playground/session', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${key}` },
+      body: JSON.stringify({ api_url: apiUrl, api_key: key }),
     });
     if (response.status === 204) {
       keyInput.value = '';
       setSignedIn(true);
       await loadProjects();
       loadGenOptions();
-    } else if (response.status === 401 || response.status === 403) {
-      showError('API key không hợp lệ.', true);
+      reconcileQueuedProjects();
     } else {
-      showError('Không xác thực được. Vui lòng thử lại.');
+      const detail = await response.json().then((data) => data?.detail).catch(() => null);
+      if (response.status === 502) {
+        showError(detail || 'Could not connect to the API URL — check the endpoint address.', 'url');
+      } else if (response.status === 422) {
+        showError(detail || 'Invalid API URL.', 'url');
+      } else if (response.status === 401 || response.status === 403) {
+        showError(detail || 'Invalid API key for this endpoint.', 'key');
+      } else {
+        showError('Could not authenticate. Please try again.');
+      }
     }
   } catch {
-    showError('Không kết nối được với máy chủ. Vui lòng thử lại.');
+    showError('Could not reach the server. Please try again.');
   } finally {
     loginButton.disabled = false;
+    urlInput.readOnly = false;
     keyInput.readOnly = false;
-    loginButton.textContent = 'Vào Playground';
-    if (!login.hidden) keyInput.focus();
+    loginButton.textContent = 'Sign in';
+    if (!login.hidden) focusLoginField();
   }
 });
 
+urlInput.addEventListener('input', () => showError());
 keyInput.addEventListener('input', () => showError());
 
 function autoGrowPrompt() {
@@ -1052,14 +1788,26 @@ prompt.addEventListener('input', () => {
   }, 500);
 });
 
-newProject.addEventListener('click', async () => {
-  let number = 1;
+// Tên project mặc định theo format Google Flow: "M d - hh:ii" (vd "Nov 23 - 14:30").
+// Tháng tiếng Anh viết tắt, ngày không số 0 đầu, giờ:phút 24h. Trùng tên đang có
+// thì thêm hậu tố " (2)", " (3)"…
+const MONTH_LABELS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+function defaultProjectName() {
+  const now = new Date();
+  const base = `${MONTH_LABELS[now.getMonth()]} ${now.getDate()} - ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
   const names = new Set(projects.map(({ name }) => name));
-  while (names.has(`Project ${number}`)) number += 1;
+  if (!names.has(base)) return base;
+  let suffix = 2;
+  while (names.has(`${base} (${suffix})`)) suffix += 1;
+  return `${base} (${suffix})`;
+}
+
+newProject.addEventListener('click', async () => {
   try {
     const response = await request('/playground/api/projects', {
       method: 'POST',
-      body: JSON.stringify({ name: `Project ${number}`, prompt: '', results: [] }),
+      body: JSON.stringify({ name: defaultProjectName(), prompt: '', results: [] }),
     });
     if (!response.ok) throw new Error('Project creation failed');
     const project = parseProject(await response.json());
@@ -1258,9 +2006,22 @@ function buildStaticRows() {
 }
 
 function renderModelRow(mode) {
-  const model = genSelectedModel(mode);
   const button = genModelButtons[mode];
   button.replaceChildren();
+  // Extend mode: khóa model theo video gốc; id không còn trong catalog vẫn
+  // hiện label gốc dạng text (backend skip spec_entry khi vmode extend).
+  if (mode === 'video' && genState.video.vmode === 'extend' && extendState) {
+    button.disabled = true;
+    button.title = 'Đang nối tiếp — model giữ theo video gốc';
+    const name = document.createElement('span');
+    name.className = 'gen-model-name';
+    name.textContent = modelLabelForId('video', extendState.model) ?? extendState.model;
+    button.append(name);
+    return;
+  }
+  button.disabled = false;
+  button.removeAttribute('title');
+  const model = genSelectedModel(mode);
   if (model.icon) button.append(modelIconSpan(model));
   const name = document.createElement('span');
   name.className = 'gen-model-name';
@@ -1310,6 +2071,11 @@ function renderModelList() {
 }
 
 function renderResRow() {
+  // Extend không dùng res — ẩn hàng để khớp validate backend.
+  if (genState.video.vmode === 'extend') {
+    genResRow.hidden = true;
+    return;
+  }
   const resolutions = genSelectedModel('video').res;
   if (!resolutions) {
     genResRow.hidden = true;
@@ -1350,6 +2116,11 @@ function renderResImageRow() {
 }
 
 function renderLengthRow() {
+  // Extend không dùng length — ẩn slider để khớp validate backend.
+  if (genState.video.vmode === 'extend') {
+    genLengthRow.hidden = true;
+    return;
+  }
   const model = genSelectedModel('video');
   if (!Array.isArray(model.length) || !model.length.length) {
     genLengthRow.hidden = true;
@@ -1389,24 +2160,41 @@ function renderGenDialog() {
   genBodies.video.hidden = genState.mode !== 'video';
   for (const mode of ['image', 'video']) {
     const allowedRatios = genSelectedModel(mode).ratios;
+    // Extend mode: ratio/qty bị khóa theo video gốc (chỉ render, không đụng
+    // genState để thoát extend trả lại đúng lựa chọn tự do trước đó).
+    const extendLocked = mode === 'video' && genState.video.vmode === 'extend';
+    const activeRatio = extendLocked ? extendState?.ratio : genState[mode].ratio;
     for (const button of genRatioRows[mode].children) {
       const supported = !Array.isArray(allowedRatios) || allowedRatios.includes(button.dataset.ratio);
-      button.classList.toggle('is-disabled', !supported);
-      if (!supported) {
-        button.setAttribute('aria-disabled', 'true');
-        button.title = 'Không hỗ trợ bởi model này';
-      } else {
-        button.removeAttribute('aria-disabled');
-        button.removeAttribute('title');
-      }
-      const active = button.dataset.ratio === genState[mode].ratio;
+      button.classList.toggle('is-disabled', !supported || extendLocked);
+      const active = button.dataset.ratio === activeRatio;
       button.classList.toggle('is-active', active);
       button.setAttribute('aria-pressed', String(active));
+      if (extendLocked) {
+        button.disabled = true;
+        button.title = 'Đang nối tiếp — tỉ lệ giữ theo video gốc';
+      } else {
+        button.disabled = false;
+        if (!supported) {
+          button.setAttribute('aria-disabled', 'true');
+          button.title = 'Không hỗ trợ bởi model này';
+        } else {
+          button.removeAttribute('aria-disabled');
+          button.removeAttribute('title');
+        }
+      }
     }
     for (const button of genQtyRows[mode].children) {
       const active = Number(button.dataset.qty) === genState[mode].qty;
       button.classList.toggle('is-active', active);
       button.setAttribute('aria-pressed', String(active));
+      if (extendLocked && button.dataset.qty !== '1') {
+        button.disabled = true;
+        button.title = 'Extend chỉ tạo 1 kết quả mỗi lần';
+      } else {
+        button.disabled = false;
+        button.removeAttribute('title');
+      }
     }
     renderModelRow(mode);
     genModelButtons[mode].setAttribute(
@@ -1414,7 +2202,19 @@ function renderGenDialog() {
       String(genModelListOpen && genState.mode === mode)
     );
   }
+  // Extend mode: cả 3 nút vmode bị khóa — thoát extend qua nút × trên chip.
+  const extendLockedVideo = genState.mode === 'video' && genState.video.vmode === 'extend';
   for (const button of genVmodeRow.querySelectorAll('.gen-seg-btn')) {
+    if (extendLockedVideo) {
+      button.classList.remove('is-active');
+      button.setAttribute('aria-pressed', 'false');
+      button.classList.add('is-disabled');
+      button.disabled = true;
+      button.title = 'Đang ở chế độ nối tiếp — bấm × trên chip để hủy';
+      button.setAttribute('aria-disabled', 'true');
+      continue;
+    }
+    button.disabled = false;
     const active = button.dataset.vmode === genState.video.vmode;
     button.classList.toggle('is-active', active);
     button.setAttribute('aria-pressed', String(active));
@@ -1474,6 +2274,12 @@ function updateGenTrigger() {
   const model = genSelectedModel(genState.mode);
   genIconImage.hidden = genState.mode !== 'image';
   genIconVideo.hidden = genState.mode !== 'video';
+  if (genState.mode === 'video' && genState.video.vmode === 'extend' && extendState) {
+    // Extend: trigger hiển thị model + tỉ lệ của video gốc, không phải state tự do.
+    const label = modelLabelForId('video', extendState.model) ?? extendState.model;
+    genLabel.textContent = `${label} · ${extendState.ratio} · x1`;
+    return;
+  }
   genLabel.textContent = `${model.label} · ${state.ratio} · x${state.qty}`;
 }
 
@@ -1485,6 +2291,8 @@ function setGenDialogOpen(open) {
 
 function setGenMode(mode) {
   if (!genBodies[mode]) return;
+  // Rời tab video khi đang nối tiếp → hủy chế độ extend (chip + khóa).
+  if (mode !== 'video' && genState.video.vmode === 'extend') exitExtendMode();
   genState.mode = mode;
   genModelListOpen = false;
   renderGenDialog();
@@ -1540,6 +2348,27 @@ genLengthSlider.addEventListener('input', () => {
 function buildGeneratePayload(promptText) {
   const mode = genState.mode;
   const state = genState[mode];
+  // Nhánh extend: khóa theo video gốc — không references/res/length, qty 1.
+  // Khớp validate backend: spec_entry bị skip khi vmode extend (model gốc có
+  // thể không còn trong catalog), ratio phải thuộc 16:9/9:16 (UI đã chặn).
+  if (mode === 'video' && state.vmode === 'extend') {
+    if (!extendState) {
+      state.vmode = 'text'; // state mồ côi (hiếm) → về text thay vì payload lỗi
+    } else {
+      return {
+        mode: 'video',
+        model: extendState.model,
+        ratio: extendState.ratio,
+        qty: 1,
+        res: null,
+        length: null,
+        vmode: 'extend',
+        extend_item_id: extendState.itemId,
+        references: [],
+        prompt: promptText,
+      };
+    }
+  }
   const model = genSelectedModel(mode);
   // Ảnh tham chiếu lấy từ selection trong stage (thứ tự chọn), chỉ item ảnh
   // còn tồn tại; cap theo mode/vmode (image 10, Frames 2, Ingredients 3).
@@ -1568,20 +2397,18 @@ function buildGeneratePayload(promptText) {
 }
 
 let creatingProject = false; // guards a double-send while no project exists yet
+let lastSubmitAt = 0; // guard double-fire vi mô (Enter/send liên tiếp <300ms)
 
 async function ensureActiveProject() {
   const existing = projects.find(({ id }) => id === activeProject);
   if (existing) return existing;
   if (creatingProject) return null;
   // Mirror the New project handler so sending always has a target project.
-  let number = 1;
-  const names = new Set(projects.map(({ name }) => name));
-  while (names.has(`Project ${number}`)) number += 1;
   creatingProject = true;
   try {
     const response = await request('/playground/api/projects', {
       method: 'POST',
-      body: JSON.stringify({ name: `Project ${number}`, prompt: prompt.value, results: [] }),
+      body: JSON.stringify({ name: defaultProjectName(), prompt: prompt.value, results: [] }),
     });
     if (!response.ok) throw new Error('Project creation failed');
     const project = parseProject(await response.json());
@@ -1603,26 +2430,33 @@ async function ensureActiveProject() {
 async function startGeneration() {
   const promptText = prompt.value.trim();
   if (!promptText) return;
+  // Composer không khoá khi có job chạy — nhưng 1 cú click/Enter không được bắn
+  // 2 job: chặn double-fire trong 300ms (không phải khóa composer).
+  const now = Date.now();
+  if (now - lastSubmitAt < 300) return;
+  lastSubmitAt = now;
   const project = await ensureActiveProject();
   if (!project) return;
-  if (jobBusy(project.id)) {
-    showToast('Đang tạo nội dung, vui lòng chờ.');
-    return;
-  }
-  await launchGeneration(project, buildGeneratePayload(promptText), { clearPrompt: true });
+  const launched = await launchGeneration(project, buildGeneratePayload(promptText), { clearPrompt: true });
+  // Job đã được server nhận → thoát chế độ nối tiếp (chip tắt, composer tự do).
+  // Bắn lỗi thì giữ nguyên extend để chỉnh prompt gửi lại.
+  if (launched) exitExtendMode();
 }
 
-// Đường chung cho generate từ composer lẫn Extend: đặt pending → POST → poll.
+// Đường chung cho generate: dựng pending card tạm → POST → thay bằng job thật
+// (jobId server trả) → poll. Mỗi lần gọi là một job độc lập xếp hàng.
 async function launchGeneration(project, payload, { clearPrompt = false } = {}) {
-  pendingByProject.set(project.id, {
+  const tmpId = `tmp:${Date.now()}:${tmpJobSeq++}`;
+  jobsById.set(tmpId, {
+    projectId: project.id,
+    jobId: tmpId,
     mode: payload.mode,
     ratio: payload.ratio,
     count: payload.qty,
     startedAt: Date.now(),
+    partial: [],
   });
-  submitting.add(project.id);
   renderResultsGrid();
-  syncComposerState();
   let response;
   try {
     response = await request(projectPath(project.id, '/generate'), {
@@ -1630,28 +2464,28 @@ async function launchGeneration(project, payload, { clearPrompt = false } = {}) 
       body: JSON.stringify(payload),
     });
   } catch {
-    clearJobState(project.id);
+    removeJob(tmpId);
     renderResultsGrid();
-    syncComposerState();
     showToast('Không kết nối được với máy chủ.');
     return false;
   }
   if (response.status === 401 || response.status === 403) {
     // Session expired: back to the key screen.
-    clearJobState(project.id);
+    removeJob(tmpId);
     setSignedIn(false);
     keyInput.focus();
     return false;
   }
   if (!response.ok) {
+    // 429 vượt PLAYGROUND_MAX_RUNNING_JOBS hoặc lỗi khác: job không được tạo,
+    // composer vẫn dùng được — hiển thị detail từ response nếu có.
     let message = 'Không tạo được nội dung.';
     try {
       const data = await response.json();
       if (data?.detail) message = String(data.detail);
     } catch { /* Keep the generic message. */ }
-    clearJobState(project.id);
+    removeJob(tmpId);
     renderResultsGrid();
-    syncComposerState();
     showToast(message);
     return false;
   }
@@ -1661,15 +2495,28 @@ async function launchGeneration(project, payload, { clearPrompt = false } = {}) 
   } catch {
     jobId = null;
   }
-  submitting.delete(project.id);
-  if (!jobId) {
-    clearJobState(project.id);
+  const entry = jobsById.get(tmpId);
+  if (!jobId || !entry) {
+    removeJob(tmpId);
     renderResultsGrid();
-    syncComposerState();
     showToast('Không tạo được nội dung.');
     return false;
   }
-  activeJobs.set(project.id, jobId);
+  // Thay khoá tạm bằng jobId thật của server (persist queue từ đây).
+  jobsById.delete(tmpId);
+  entry.jobId = jobId;
+  if (jobsById.has(jobId)) {
+    // Reconcile đã adopt job này (race với tab khác) — chỉ hợp nhất metadata.
+    Object.assign(jobsById.get(jobId), {
+      mode: entry.mode,
+      ratio: entry.ratio,
+      count: entry.count,
+      partial: entry.partial ?? [],
+    });
+  } else {
+    jobsById.set(jobId, entry);
+  }
+  persistJobQueue();
   if (clearPrompt) {
     // Job đã được server nhận — xoá nội dung đã gửi khỏi ô chat (kèm xoá draft
     // phía server ở nền, không cần chờ).
@@ -1683,7 +2530,7 @@ async function launchGeneration(project, payload, { clearPrompt = false } = {}) 
       body: JSON.stringify({ prompt: '' }),
     }).catch(() => { /* draft sync best-effort */ });
   }
-  startPolling(project.id, jobId);
+  startPolling(jobId);
   return true;
 }
 
@@ -1711,6 +2558,19 @@ document.addEventListener('click', (event) => {
   }
 });
 document.addEventListener('keydown', (event) => {
+  // Gallery ảnh đang mở: ←/→ duyệt ảnh (mới hơn / cũ hơn).
+  if (!lightbox.hidden && galleryState) {
+    if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      galleryShift(-1);
+      return;
+    }
+    if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      galleryShift(1);
+      return;
+    }
+  }
   if (event.key !== 'Escape') return;
   if (marqueeState) {
     event.preventDefault();
@@ -1727,24 +2587,20 @@ document.addEventListener('keydown', (event) => {
     closeItemDialog();
     return;
   }
-  if (!paintEditor.hidden) {
-    event.preventDefault();
-    closePaintEditor();
-    return;
-  }
   if (!maskEditor.hidden) {
     event.preventDefault();
     closeMaskEditor();
     return;
   }
-  if (!extendDialog.hidden) {
-    event.preventDefault();
-    closeExtendDialog();
-    return;
-  }
   if (!wmModal.hidden) {
     event.preventDefault();
     wmModal.hidden = true;
+    return;
+  }
+  if (!videoEditor.hidden) {
+    // Editor đè lên các modal khác — đóng nó trước.
+    event.preventDefault();
+    closeVideoEditor();
     return;
   }
   if (!lightbox.hidden) {
@@ -1772,7 +2628,7 @@ document.addEventListener('keydown', (event) => {
 logout.addEventListener('click', async () => {
   try { await request('/playground/logout', { method: 'POST' }); } catch { /* Clear local UI regardless. */ }
   setSignedIn(false);
-  keyInput.focus();
+  focusLoginField();
 });
 window.addEventListener('pagehide', () => {
   keyInput.value = '';
@@ -1787,14 +2643,8 @@ renderGenDialog();
 renderResultsGrid();
 restoreSession();
 
-// --- Items: rename / tham chiếu / xóa / bôi vùng làm tham chiếu --------------
+// --- Items: rename / re-use prompt / download / xóa --------------------------
 
-const paintEditor = document.querySelector('#paint-editor');
-const paintCanvas = document.querySelector('#paint-canvas');
-const paintBrush = document.querySelector('#paint-brush');
-const paintReset = document.querySelector('#paint-reset');
-const paintCancel = document.querySelector('#paint-cancel');
-const paintSave = document.querySelector('#paint-save');
 const itemDialog = document.querySelector('#item-dialog');
 const itemDialogForm = document.querySelector('#item-dialog-form');
 const itemDialogTitle = document.querySelector('#item-dialog-title');
@@ -1804,7 +2654,6 @@ const itemDialogCancel = document.querySelector('#item-dialog-cancel');
 const itemDialogSubmit = document.querySelector('#item-dialog-submit');
 
 let openResultMenu = null; // { toggle, actions, projectId, itemId }
-let paintState = null; // { projectId, item, img, strokes, dirty }
 let itemDialogState = null; // { mode: 'rename'|'delete', projectId, item }
 
 async function responseErrorMessage(response) {
@@ -1842,6 +2691,7 @@ function replaceProjectWith(updated) {
     renderResultsGrid();
     renderGenDialog();
     renderComposerRefs();
+    syncSelectionToolbar();
   }
   return parsed;
 }
@@ -1941,33 +2791,66 @@ function positionMenu(actions, rect) {
   actions.style.top = `${top}px`;
 }
 
+// Tên file an toàn: thay ký tự cấm trong filename bằng '_' (Windows/macOS/Linux).
+function sanitizeFilename(name) {
+  return String(name ?? '')
+    .replace(/[\\/:*?"<>|]+/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120) || 'item';
+}
+
+// Download item: fetch blob cùng origin → objectURL → <a download> click.
+// Lỗi thì toast, không crash; tên file = item.name + ext theo url/kind.
+async function downloadItem(item) {
+  const isVideo = item.kind === 'video';
+  const url = typeof item.url === 'string' ? item.url : '';
+  if (!url) {
+    showToast('Item này không có tệp để tải.');
+    return;
+  }
+  const ext = (() => {
+    if (isVideo) return '.mp4';
+    const match = /\.([A-Za-z0-9]{2,5})(?:[?#]|$)/.exec(url);
+    const found = match?.[1]?.toLowerCase();
+    if (found === 'jpg' || found === 'jpeg') return '.jpg';
+    if (found === 'png' || found === 'webp') return `.${found}`;
+    return '.png';
+  })();
+  try {
+    const response = await fetch(url, { credentials: 'same-origin' });
+    if (response.status === 401) {
+      setSignedIn(false);
+      return;
+    }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = `${sanitizeFilename(itemDisplayName(item, isVideo))}${ext}`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 4000);
+  } catch {
+    showToast('Không tải được tệp của item này.');
+  }
+}
+
+// Menu trên card chỉ còn đúng 4 mục: Đổi tên / Re-use prompt / Download / Xóa.
+// (Tham chiếu/bôi chọn dùng marquee selection; mask làm qua panel Mask WM.)
 function openResultMenuFor(toggle, item) {
   const projectId = activeProject;
   if (!projectId) return;
   const actions = document.createElement('div');
   actions.className = 'result-menu-list';
-  const buttons = [];
   const renameBtn = makeButton('result-menu-item', 'Đổi tên');
-  buttons.push(renameBtn);
-  let paintBtn = null;
-  let maskBtn = null;
-  let extendBtn = null;
-  if (item.kind === 'image') {
-    const isRef = item.role === 'reference';
-    const refToggle = makeButton('result-menu-item', isRef ? 'Bỏ đánh dấu tham chiếu' : 'Đổi thành tham chiếu');
-    paintBtn = makeButton('result-menu-item', 'Bôi vùng làm tham chiếu');
-    if (item.meta?.model && item.meta?.ratio) {
-      maskBtn = makeButton('result-menu-item', 'Tạo mask WM từ ảnh này');
-    }
-    buttons.push(refToggle, paintBtn, ...(maskBtn ? [maskBtn] : []));
-  } else if (item.kind === 'video' && item.meta?.media_generation_id) {
-    // Chỉ video tạo trong playground mới có media id để nối tiếp (Extend).
-    extendBtn = makeButton('result-menu-item', 'Nối tiếp video này (Extend)');
-    buttons.push(extendBtn);
-  }
+  const promptText = typeof item.meta?.prompt === 'string' ? item.meta.prompt.trim() : '';
+  const reuseBtn = promptText ? makeButton('result-menu-item', 'Re-use prompt') : null;
+  const downloadBtn = makeButton('result-menu-item', 'Download');
   const deleteBtn = makeButton('result-menu-item is-danger', 'Xóa');
-  buttons.push(deleteBtn);
-  actions.append(...buttons);
+  actions.append(renameBtn, ...(reuseBtn ? [reuseBtn] : []), downloadBtn, deleteBtn);
   document.body.append(actions);
   positionMenu(actions, toggle.getBoundingClientRect());
 
@@ -1975,31 +2858,16 @@ function openResultMenuFor(toggle, item) {
     closeResultMenu();
     openItemDialog('rename', projectId, item);
   });
-  if (paintBtn) {
-    const refToggle = buttons[1];
-    refToggle.addEventListener('click', () => {
+  if (reuseBtn) {
+    reuseBtn.addEventListener('click', () => {
       closeResultMenu();
-      // Selection là nguồn sự thật cho role — đổi selection là đủ, sync
-      // role chạy ngầm theo debounce.
-      setSelected(item.id, !isSelected(item.id));
-    });
-    paintBtn.addEventListener('click', () => {
-      closeResultMenu();
-      openPaintEditor(projectId, item);
-    });
-    if (maskBtn) {
-      maskBtn.addEventListener('click', () => {
-        closeResultMenu();
-        openMaskEditor(item);
-      });
-    }
-  }
-  if (extendBtn) {
-    extendBtn.addEventListener('click', () => {
-      closeResultMenu();
-      openExtendDialog(projectId, item);
+      reuseItemPrompt(item);
     });
   }
+  downloadBtn.addEventListener('click', () => {
+    closeResultMenu();
+    downloadItem(item);
+  });
   deleteBtn.addEventListener('click', () => {
     closeResultMenu();
     openItemDialog('delete', projectId, item);
@@ -2008,120 +2876,6 @@ function openResultMenuFor(toggle, item) {
   openResultMenu = { toggle, actions, projectId, itemId: String(item.id) };
   toggle.setAttribute('aria-expanded', 'true');
 }
-
-// ── Paint editor ─────────────────────────────────────────────────────────────
-
-function paintRedraw() {
-  if (!paintState) return;
-  const { img, strokes } = paintState;
-  const ctx = paintCanvas.getContext('2d');
-  ctx.clearRect(0, 0, paintCanvas.width, paintCanvas.height);
-  ctx.drawImage(img, 0, 0, paintCanvas.width, paintCanvas.height);
-  const brush = Number(paintBrush.value);
-  ctx.strokeStyle = 'rgba(215, 244, 125, 0.65)';
-  ctx.fillStyle = 'rgba(215, 244, 125, 0.4)';
-  ctx.lineCap = 'round';
-  ctx.lineJoin = 'round';
-  for (const stroke of strokes) {
-    if (stroke.length === 1) {
-      ctx.beginPath();
-      ctx.arc(stroke[0].x, stroke[0].y, brush / 2, 0, Math.PI * 2);
-      ctx.fill();
-      continue;
-    }
-    ctx.lineWidth = brush;
-    ctx.beginPath();
-    ctx.moveTo(stroke[0].x, stroke[0].y);
-    for (const point of stroke.slice(1)) ctx.lineTo(point.x, point.y);
-    ctx.stroke();
-  }
-  paintSave.disabled = strokes.length === 0;
-}
-
-async function openPaintEditor(projectId, item) {
-  paintState = null;
-  paintEditor.hidden = false;
-  try {
-    const response = await fetch(item.url, { credentials: 'same-origin' });
-    if (!response.ok) throw new Error('load failed');
-    const blob = await response.blob();
-    const bitmap = await createImageBitmap(blob);
-    paintState = { projectId, item, img: bitmap, strokes: [] };
-    paintCanvas.width = bitmap.width;
-    paintCanvas.height = bitmap.height;
-    paintRedraw();
-    paintCanvas.focus?.();
-  } catch {
-    paintEditor.hidden = true;
-    showToast('Không tải được ảnh để bôi vùng.');
-  }
-}
-
-function closePaintEditor() {
-  paintState = null;
-  paintEditor.hidden = true;
-}
-
-function paintCanvasPoint(event) {
-  const rect = paintCanvas.getBoundingClientRect();
-  const scaleX = paintCanvas.width / rect.width;
-  const scaleY = paintCanvas.height / rect.height;
-  return {
-    x: (event.clientX - rect.left) * scaleX,
-    y: (event.clientY - rect.top) * scaleY,
-  };
-}
-
-paintCanvas.addEventListener('pointerdown', (event) => {
-  if (!paintState) return;
-  event.preventDefault();
-  paintCanvas.setPointerCapture(event.pointerId);
-  const stroke = [paintCanvasPoint(event)];
-  paintState.strokes.push(stroke);
-  paintRedraw();
-});
-paintCanvas.addEventListener('pointermove', (event) => {
-  if (!paintState || !paintState.strokes.length) return;
-  if (!(event.buttons & 1)) return;
-  paintState.strokes[paintState.strokes.length - 1].push(paintCanvasPoint(event));
-  paintRedraw();
-});
-paintCanvas.addEventListener('pointerup', () => paintRedraw());
-
-paintBrush.addEventListener('input', paintRedraw);
-paintReset.addEventListener('click', () => {
-  if (!paintState) return;
-  paintState.strokes = [];
-  paintRedraw();
-});
-paintCancel.addEventListener('click', closePaintEditor);
-paintSave.addEventListener('click', async () => {
-  if (!paintState || !paintState.strokes.length) return;
-  const { projectId, item, img, strokes } = paintState;
-  // Bounding box của toàn bộ nét bôi + đệm nhỏ → crop chính vùng được chọn.
-  const points = strokes.flat();
-  const minX = Math.min(...points.map((p) => p.x));
-  const maxX = Math.max(...points.map((p) => p.x));
-  const minY = Math.min(...points.map((p) => p.y));
-  const maxY = Math.max(...points.map((p) => p.y));
-  const pad = Math.max(8, Math.round(Math.min(img.width, img.height) * 0.02));
-  const sx = Math.max(0, Math.floor(minX - pad));
-  const sy = Math.max(0, Math.floor(minY - pad));
-  const sw = Math.min(img.width - sx, Math.ceil(maxX - minX + pad * 2));
-  const sh = Math.min(img.height - sy, Math.ceil(maxY - minY + pad * 2));
-  if (sw <= 0 || sh <= 0) return;
-  const crop = document.createElement('canvas');
-  crop.width = sw;
-  crop.height = sh;
-  crop.getContext('2d').drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
-  const dataUrl = crop.toDataURL('image/png');
-  closePaintEditor();
-  const updated = await updateProjectItem(projectId, String(item.id), {
-    image: dataUrl,
-    role: 'reference',
-  });
-  if (updated) showToast('Item đã thành ảnh tham chiếu.');
-});
 
 // ── Item dialog (rename / confirm delete) ───────────────────────────────────
 
@@ -2184,18 +2938,56 @@ const maskReset = document.querySelector('#mask-reset');
 const maskCancel = document.querySelector('#mask-cancel');
 const maskSave = document.querySelector('#mask-save');
 const maskTitle = document.querySelector('#mask-editor-title');
+const maskUnderlay = document.querySelector('#mask-underlay');
+const maskNavPrev = document.querySelector('#mask-prev');
+const maskNavNext = document.querySelector('#mask-next');
+const maskNavLabel = document.querySelector('#mask-nav-label');
+const maskSampleGen = document.querySelector('#mask-sample-gen');
+const maskEmptyHint = document.querySelector('#mask-empty-hint');
 
-let maskState = null; // { key, img, strokes }
+let maskState = null; // { key, ratio, res, base, modelId, strokes, baseMaskCanvas } — canvas trong suốt + nét trắng
+let maskNav = null; // { images: [item], index } — ảnh ví dụ + tham khảo duyệt bằng ◀ ▶
+let maskEditorReturnToPanel = false; // mở editor từ Mask WM panel → đóng xong quay lại panel
+let maskEditorEpoch = 0; // bỏ kết quả GET sample/mask của editor đã đóng/thay thế
+
+// Mask đã lưu (PNG nền đen + nét trắng) → canvas trắng-trên-trong suốt cùng
+// kích thước editor, ghép được cả vào màn hình vẽ lẫn bitmap export. Vùng đen
+// của file mask phải biến mất (không che ảnh nền) nên ép alpha theo độ sáng 0/255.
+function maskWhiteLayerFromImage(img, width, height) {
+  const off = document.createElement('canvas');
+  off.width = width;
+  off.height = height;
+  const octx = off.getContext('2d');
+  octx.drawImage(img, 0, 0, width, height);
+  const frame = octx.getImageData(0, 0, width, height);
+  const px = frame.data;
+  for (let i = 0; i < px.length; i += 4) {
+    // Đọc độ sáng TRƯỚC khi ghi đè kênh màu — mask 0/255, chỉ vùng sáng > 127
+    // giữ alpha 255 (nét trắng); nếu ghi 255 vào kênh đỏ trước thì mọi pixel
+    // đều "sáng" → cả canvas trắng đục che mất ảnh nền.
+    const on = px[i] > 127;
+    px[i] = 255;
+    px[i + 1] = 255;
+    px[i + 2] = 255;
+    px[i + 3] = on ? 255 : 0;
+  }
+  octx.putImageData(frame, 0, 0);
+  return off;
+}
 
 function maskRedraw() {
   if (!maskState) return;
-  const { img, strokes } = maskState;
+  const { strokes, baseMaskCanvas } = maskState;
   const ctx = maskCanvas.getContext('2d');
+  // Canvas chỉ vẽ mask đã lưu (nếu có) + nét trắng trên nền trong suốt — nền
+  // đen do CSS box đảm nhiệm, ảnh tham khảo là element underlay nằm dưới canvas
+  // nên không bao giờ lẫn vào nét vẽ; mask khi export (maskSave) vẫn vẽ lại
+  // nền đen + mask cũ + nét trắng nguyên bản.
   ctx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
-  ctx.drawImage(img, 0, 0, maskCanvas.width, maskCanvas.height);
+  if (baseMaskCanvas) ctx.drawImage(baseMaskCanvas, 0, 0, maskCanvas.width, maskCanvas.height);
   const brush = Number(maskBrush.value);
-  ctx.strokeStyle = 'rgba(255, 84, 84, 0.6)';
-  ctx.fillStyle = 'rgba(255, 84, 84, 0.35)';
+  ctx.strokeStyle = '#fff';
+  ctx.fillStyle = '#fff';
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
   for (const stroke of strokes) {
@@ -2224,40 +3016,173 @@ function maskCanvasPoint(event) {
   };
 }
 
-async function openMaskEditor(item) {
-  // Mask key theo base model + tỉ lệ: gen-options trả base cho từng model id.
-  const spec = optionsFor('image')?.models?.find((model) => model.id === item.meta?.model)
-    ?? optionsFor('video')?.models?.find((model) => model.id === item.meta?.model);
-  const base = spec?.base;
-  const ratio = item.meta?.ratio;
-  if (!base || !ratio) {
-    showToast('Ảnh này thiếu thông tin model/ratio — không tạo được mask.');
+// Resolve base alias của 1 model id qua catalog gen-options (nguồn sự thật).
+function modelBaseFor(modelId) {
+  if (typeof modelId !== 'string') return null;
+  for (const mode of ['image', 'video']) {
+    const spec = (optionsFor(mode)?.models ?? []).find((model) => model.id === modelId);
+    if (typeof spec?.base === 'string' && spec.base) return spec.base;
+  }
+  return null;
+}
+
+// Ảnh tham khảo cho mask key: item image trong project active cùng base model
+// + cùng ratio + cùng res với key đang vẽ (WM layout khác theo res — ảnh lệch
+// res làm nền sẽ dẫn sai); sort mới nhất trước (results append theo thời gian).
+function maskReferenceImages(base, ratio, res = null) {
+  const project = activeProjectData();
+  if (!project || !base || !ratio) return [];
+  const resLower = res ? String(res).toLowerCase() : null;
+  return (Array.isArray(project.results) ? project.results : [])
+    .filter((item) => item && item.kind === 'image'
+      && typeof item.url === 'string'
+      && item.meta?.ratio === ratio
+      && (!resLower || String(item.meta?.res ?? '').toLowerCase() === resLower)
+      && modelBaseFor(item.meta?.model) === base)
+    .reverse();
+}
+
+// ◀ ▶ chỉ đổi underlay (ảnh mờ dưới canvas) — strokes giữ nguyên vì mask dùng
+// chung cả nhóm cùng base + ratio. Hết danh sách thì disable nút tương ứng.
+// Không có nền nào → hiện hint và chặn vẽ (tô mù trên nền đen ra mask vô dụng).
+function maskSyncNav() {
+  const images = maskNav?.images ?? [];
+  const hasImages = images.length > 0;
+  maskNavPrev.hidden = !hasImages;
+  maskNavNext.hidden = !hasImages;
+  maskNavLabel.hidden = !hasImages;
+  maskEmptyHint.hidden = hasImages;
+  maskCanvas.classList.toggle('is-idle', !hasImages);
+  if (!hasImages) {
+    maskUnderlay.removeAttribute('src');
+    maskUnderlay.hidden = true;
     return;
   }
-  maskState = null;
-  maskTitle.textContent = `Tô vùng WM cần xoá — ${base} · ${ratio}`;
-  maskEditor.hidden = false;
+  maskNav.index = Math.min(Math.max(maskNav.index, 0), images.length - 1);
+  const item = images[maskNav.index];
+  maskUnderlay.src = item.url;
+  maskUnderlay.hidden = false;
+  maskNavPrev.disabled = maskNav.index === 0;
+  maskNavNext.disabled = maskNav.index === images.length - 1;
+  maskNavLabel.textContent = `${maskNav.index + 1}/${images.length}`;
+}
+
+function maskNavShift(delta) {
+  if (!maskNav || !maskNav.images.length) return;
+  maskNav.index += delta;
+  maskSyncNav();
+}
+
+maskNavPrev.addEventListener('click', () => maskNavShift(-1));
+maskNavNext.addEventListener('click', () => maskNavShift(1));
+
+// "Gen 1 ảnh ví dụ": tạo 1 ảnh mẫu cho đúng model + tỉ lệ + res của key đang
+// vẽ, giữ nguyên watermark làm nền tô mask. Server lưu ảnh vào thư mục mask
+// (prefix sample_) → các lần mở editor sau tự có nền sẵn.
+maskSampleGen.addEventListener('click', async () => {
+  if (!maskState?.modelId || maskSampleGen.disabled) return;
+  const requesting = maskState; // editor có thể đóng giữa chừng — so tham chiếu
+  maskSampleGen.disabled = true;
+  const label = maskSampleGen.textContent;
+  maskSampleGen.textContent = 'Đang tạo…';
   try {
-    const response = await fetch(item.url, { credentials: 'same-origin' });
-    if (!response.ok) throw new Error('load failed');
-    const bitmap = await createImageBitmap(await response.blob());
-    maskState = { key: `${base}:${ratio}`, img: bitmap, strokes: [] };
-    maskCanvas.width = bitmap.width;
-    maskCanvas.height = bitmap.height;
-    maskRedraw();
-  } catch (err) {
-    maskEditor.hidden = true;
-    showToast(`Không tải được ảnh để tạo mask: ${err?.message || err}`);
+    const response = await request('/playground/api/watermark/sample', {
+      method: 'POST',
+      body: JSON.stringify({ model: requesting.modelId, ratio: requesting.ratio, res: requesting.res }),
+    });
+    if (maskState !== requesting) return; // đã đóng / mở key khác — bỏ qua
+    if (!response.ok) {
+      showToast((await responseErrorMessage(response)) || 'Không tạo được ảnh ví dụ.');
+      return;
+    }
+    const data = await response.json();
+    if (!maskNav) maskNav = { images: [], index: 0 };
+    maskNav.images = maskNav.images.filter((img) => !img.sample);
+    maskNav.images.unshift({ url: data.url, sample: true });
+    maskNav.index = 0;
+    maskSyncNav();
+    showToast('Đã tạo ảnh ví dụ — lưu lại làm nền vẽ mask cho lần sau.');
+  } catch {
+    if (maskState === requesting) showToast('Không tạo được ảnh ví dụ.');
+  } finally {
+    maskSampleGen.disabled = false;
+    maskSampleGen.textContent = label;
   }
+});
+
+// Mở mask editor cho 1 key bất kỳ từ panel — canvas theo tỉ lệ của key. Nền vẽ
+// là ảnh ví dụ đã lưu cho key (nếu có, luôn đứng đầu) + ảnh cùng base model +
+// ratio + res trong project active (◀ ▶ duyệt, label "i/n" dưới cạnh). Chưa có
+// nền nào thì chặn vẽ — phải bấm "Gen 1 ảnh ví dụ" trước.
+function openMaskEditorForKey(key, ratio, base = null, modelId = null, res = null) {
+  const shape = (() => {
+    if (typeof ratio !== 'string' || !/^\d+:\d+$/.test(ratio)) return { w: 1, h: 1 };
+    const [w, h] = ratio.split(':').map(Number);
+    return w && h ? { w, h } : { w: 1, h: 1 };
+  })();
+  const longSide = 1024;
+  const horizontal = shape.w >= shape.h;
+  const width = horizontal ? longSide : Math.max(1, Math.round((longSide * shape.w) / shape.h));
+  const height = horizontal ? Math.max(1, Math.round((longSide * shape.h) / shape.w)) : longSide;
+  // Editor đè lên panel (z-index thấp hơn) → đóng panel tạm, lưu ý quay lại sau.
+  maskEditorReturnToPanel = true;
+  wmModal.hidden = true;
+  const state = { key, ratio, res, base, modelId, strokes: [], baseMaskCanvas: null };
+  maskState = state;
+  maskCanvas.width = width;
+  maskCanvas.height = height;
+  maskTitle.textContent = `Vẽ vùng WM cần xoá — ${key}`;
+  const images = base ? maskReferenceImages(base, ratio, res) : [];
+  maskNav = { images, index: 0 };
+  const epoch = ++maskEditorEpoch;
+  maskSyncNav();
+  maskEditor.hidden = false;
+  maskRedraw();
+  // Ảnh ví dụ đã lưu cho key (GET trả 404 nếu chưa có) nạp không đồng bộ —
+  // có thì đẩy lên đầu danh sách underlay.
+  const sampleUrl = `/playground/api/watermark/sample/${encodeURIComponent(sanitizeMaskKey(key))}`;
+  request(sampleUrl).then(async (response) => {
+    if (epoch !== maskEditorEpoch || !response.ok || maskState !== state || !maskNav) return;
+    if (maskNav.images.some((img) => img.sample)) return;
+    maskNav.images.unshift({ url: sampleUrl, sample: true });
+    maskNav.index = 0;
+    maskSyncNav();
+  }).catch(() => { /* chưa có sample — dùng ảnh tham khảo trong project */ });
+  // Mask đã lưu cho key nạp không đồng bộ về hiện trên canvas: vẽ thêm là
+  // NỐI vào mask cũ (export gộp cả hai), "Đặt lại" mới xoá cả mask cũ.
+  const maskUrl = `/playground/api/watermark/mask/${encodeURIComponent(sanitizeMaskKey(key))}`;
+  request(maskUrl).then(async (response) => {
+    if (epoch !== maskEditorEpoch || !response.ok || maskState !== state) return;
+    const blobUrl = URL.createObjectURL(await response.blob());
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(blobUrl);
+      if (epoch !== maskEditorEpoch || maskState !== state) return;
+      state.baseMaskCanvas = maskWhiteLayerFromImage(img, width, height);
+      maskRedraw();
+    };
+    img.onerror = () => URL.revokeObjectURL(blobUrl);
+    img.src = blobUrl;
+  }).catch(() => { /* chưa có mask cho key */ });
 }
 
 function closeMaskEditor() {
+  const backToPanel = maskEditorReturnToPanel;
+  maskEditorReturnToPanel = false;
   maskState = null;
+  maskNav = null;
+  maskEditorEpoch += 1; // response sample cũ không được chạm vào editor mới
+  maskSyncNav(); // ẩn underlay + nút duyệt
   maskEditor.hidden = true;
+  if (backToPanel && wmModal.hidden) {
+    // Mở từ panel (vẽ/xóa/lưu xong) → quay lại panel và nạp trạng thái mới.
+    wmModal.hidden = false;
+    loadWmInfo();
+  }
 }
 
 maskCanvas.addEventListener('pointerdown', (event) => {
-  if (!maskState) return;
+  if (!maskState || !maskNav?.images.length) return; // chưa có nền → không cho tô mù
   event.preventDefault();
   maskCanvas.setPointerCapture(event.pointerId);
   maskState.strokes.push([maskCanvasPoint(event)]);
@@ -2273,20 +3198,27 @@ maskCanvas.addEventListener('pointerup', () => maskRedraw());
 maskBrush.addEventListener('input', maskRedraw);
 maskReset.addEventListener('click', () => {
   if (!maskState) return;
+  // Vẽ lại từ đầu: xoá cả nét mới lẫn mask cũ đã nạp — nếu chỉ muốn bỏ nét
+  // mới thì Hủy (không Lưu) là đủ.
   maskState.strokes = [];
+  maskState.baseMaskCanvas = null;
   maskRedraw();
 });
 maskCancel.addEventListener('click', closeMaskEditor);
 maskSave.addEventListener('click', async () => {
   if (!maskState || !maskState.strokes.length) return;
-  const { key, img, strokes } = maskState;
-  // Mask export: nền đen + nét trắng đục cùng brush — server chuẩn hoá 0/255.
+  const { key, strokes, baseMaskCanvas } = maskState;
+  // Mask export: nền đen + mask cũ (nếu có — vẽ thêm là nối vào mask cũ) +
+  // nét trắng đục cùng brush — server chuẩn hoá 0/255. Kích thước lấy theo
+  // canvas đang vẽ (khớp bitmap khi mở từ item; theo tỉ lệ của key khi mở từ
+  // panel không có ảnh gốc).
   const out = document.createElement('canvas');
-  out.width = img.width;
-  out.height = img.height;
+  out.width = maskCanvas.width;
+  out.height = maskCanvas.height;
   const ctx = out.getContext('2d');
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, out.width, out.height);
+  if (baseMaskCanvas) ctx.drawImage(baseMaskCanvas, 0, 0, out.width, out.height);
   const brush = Number(maskBrush.value);
   ctx.strokeStyle = '#fff';
   ctx.fillStyle = '#fff';
@@ -2318,133 +3250,209 @@ maskSave.addEventListener('click', async () => {
       return;
     }
     showToast(`Đã lưu mask ${savedKey} — lần tạo sau sẽ tự xoá WM.`);
+    // Panel đang mở (quay lại từ editor) → làm mới trạng thái mask.
+    if (!wmModal.hidden) loadWmInfo();
   } catch {
     showToast('Không lưu được mask.');
   }
 });
 
-// ── WM settings modal (danh sách mask + engine) ─────────────────────────────
+// ── Mask WM panel (quản lý mask theo model image × ratio/res) ───────────────
 
 const wmModal = document.querySelector('#wm-modal');
 const wmEngine = document.querySelector('#wm-engine');
-const wmMaskList = document.querySelector('#wm-mask-list');
+const wmMaskGrid = document.querySelector('#wm-mask-grid');
+const wmOther = document.querySelector('#wm-other');
+const wmOtherCount = document.querySelector('#wm-other-count');
+const wmOtherList = document.querySelector('#wm-other-list');
+const wmFilterActive = document.querySelector('#wm-filter-active');
 const wmClose = document.querySelector('#wm-close');
 
-wmSettingsButton.addEventListener('click', () => {
+let wmInfo = null; // { enabled, engine, masks } từ GET /playground/api/watermark
+
+// Mirror hàm _mask_keys_for phía backend: key chính "{base}:{ratio}:{res}"
+// (WM layout khác nhau theo res — 1K ≠ 2K nên mask tách theo res) + fallback
+// "{base}-{orient}-{res}" rồi "{base}-{orient}". Orientation mirror đủ 5 nhóm
+// của ASPECT_RATIO_MAP (catalog.py) — backend sinh fallback key theo nhóm này,
+// thu gọn nhị phân portrait/landscape sẽ khớp sai cho 4:3 / 1:1 / 3:4.
+const MASK_RATIO_ORIENTATIONS = {
+  '16:9': 'landscape',
+  '4:3': 'four-three',
+  '1:1': 'square',
+  '3:4': 'three-four',
+  '9:16': 'portrait',
+};
+
+function maskOrientation(ratio) {
+  return MASK_RATIO_ORIENTATIONS[ratio] ?? (ratio === '9:16' ? 'portrait' : 'landscape');
+}
+
+// Keys của 1 combo model + ratio + res (image sau validate luôn có res, mặc
+// định 1K — mirror backend; không res thì rơi về key cũ theo ratio).
+function maskKeysFor(base, ratio, res = null) {
+  if (!base || !ratio) return [];
+  const orient = maskOrientation(ratio);
+  const resLower = res ? String(res).toLowerCase() : null;
+  if (!resLower) return [`${base}:${ratio}`, `${base}-${orient}`];
+  return [`${base}:${ratio}:${resLower}`, `${base}-${orient}-${resLower}`, `${base}-${orient}`];
+}
+
+// Mirror sanitize_key (app/watermark.py): server lưu file mask + trả về key
+// dạng filename stem ĐÃ sanitize ("gemini-3.0-pro-image:9:16" →
+// "gemini-3.0-pro-image_9_16"). So khớp phải sanitize trước, nếu không panel
+// vĩnh viễn báo "Chưa có mask" cho key có ký tự ngoài [A-Za-z0-9._-] (dấu ':').
+function sanitizeMaskKey(key) {
+  const safe = String(key ?? '').replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[._]+|[._]+$/g, '');
+  return safe || 'default';
+}
+
+function savedMaskKeys() {
+  return new Set((Array.isArray(wmInfo?.masks) ? wmInfo.masks : []).map((mask) => String(mask.key)));
+}
+
+function hasSavedMask(key) {
+  return savedMaskKeys().has(sanitizeMaskKey(key));
+}
+
+// Model image có base alias (điều kiện compose mask key); gen-options là nguồn
+// sự thật — model tĩnh offline không có base nên bị lọc ra.
+function wmImageModels() {
+  const models = Array.isArray(optionsFor('image')?.models) ? optionsFor('image').models : [];
+  return models.filter((model) => typeof model.base === 'string' && model.base);
+}
+
+function wmModelRatios(model) {
+  return Array.isArray(model.ratios) && model.ratios.length ? model.ratios : GEN_OPTIONS.image.ratios;
+}
+
+function wmActiveModel() {
+  const models = wmImageModels();
+  return models.find((model) => model.id === genState.image.model) ?? models[0] ?? null;
+}
+
+async function openWmPanel() {
   wmModal.hidden = false;
-  loadWmInfo();
-});
-wmClose.addEventListener('click', () => { wmModal.hidden = true; });
-wmModal.addEventListener('click', (event) => {
-  if (event.composedPath()[0] === wmModal) wmModal.hidden = true;
-});
+  // Panel cần base alias từ gen-options; chưa nạp thì nạp trước (best-effort).
+  if (!GEN_CAPS) await loadGenOptions();
+  await loadWmInfo();
+}
 
 async function loadWmInfo() {
   try {
     const response = await request('/playground/api/watermark');
     if (!response.ok) throw new Error('load failed');
-    const info = await response.json();
-    const engine = typeof info.engine === 'string' ? info.engine : 'disabled';
-    wmEngine.textContent = info.enabled
-      ? `Bật · engine: ${engine} · ${Array.isArray(info.masks) ? info.masks.length : 0} mask`
-      : 'Đang tắt (WATERMARK_ENABLED=0)';
-    wmMaskList.replaceChildren(
-      ...(Array.isArray(info.masks) ? info.masks : []).map((mask) => {
-        const row = document.createElement('li');
-        row.className = 'wm-mask-row';
-        const name = document.createElement('span');
-        name.className = 'wm-mask-key';
-        name.textContent = mask.key === '__global__' ? 'watermark.png (dùng chung)' : mask.key;
-        const remove = makeButton('wm-mask-delete', 'Xóa');
-        remove.addEventListener('click', async () => {
-          try {
-            const response = await request(
-              `/playground/api/watermark/mask/${encodeURIComponent(mask.key)}`,
-              { method: 'DELETE' },
-            );
-            if (response.ok || response.status === 404) {
-              loadWmInfo();
-              return;
-            }
-            showToast('Không xóa được mask.');
-          } catch {
-            showToast('Không xóa được mask.');
-          }
-        });
-        row.append(name, remove);
-        return row;
-      })
-    );
+    wmInfo = await response.json();
+    renderWmPanel();
   } catch {
     wmEngine.textContent = 'Không tải được trạng thái watermark.';
   }
 }
 
-// ── Extend: nối tiếp video đã tạo bằng prompt ───────────────────────────────
-
-const extendDialog = document.querySelector('#extend-dialog');
-const extendForm = document.querySelector('#extend-form');
-const extendPrompt = document.querySelector('#extend-prompt');
-const extendError = document.querySelector('#extend-error');
-const extendCancel = document.querySelector('#extend-cancel');
-const extendSubmit = document.querySelector('#extend-submit');
-
-let extendState = null; // { projectId, item }
-
-function openExtendDialog(projectId, item) {
-  extendState = { projectId, item };
-  extendError.hidden = true;
-  extendPrompt.value = '';
-  extendSubmit.disabled = false;
-  const ratio = item.meta?.ratio ? ` · ${item.meta.ratio}` : '';
-  extendDialog.querySelector('#extend-title').textContent =
-    `Nối tiếp video này${ratio}`;
-  extendDialog.hidden = false;
-  extendPrompt.focus();
+async function wmDeleteKeys(keys) {
+  let failure = false;
+  for (const target of keys) {
+    try {
+      const response = await request(
+        `/playground/api/watermark/mask/${encodeURIComponent(target)}`,
+        { method: 'DELETE' },
+      );
+      if (!response.ok && response.status !== 404) failure = true;
+    } catch {
+      failure = true;
+    }
+  }
+  if (failure) showToast('Không xóa được một số mask.');
+  await loadWmInfo();
 }
 
-function closeExtendDialog() {
-  extendState = null;
-  extendDialog.hidden = true;
+function wmMaskRow(model, ratio, res) {
+  const keys = maskKeysFor(model.base, ratio, res);
+  const existing = keys.filter((key) => hasSavedMask(key));
+  const row = document.createElement('div');
+  row.className = `wm-mask-item${existing.length ? ' has-mask' : ''}`;
+  row.setAttribute('role', 'listitem');
+  const status = document.createElement('span');
+  status.className = `wm-mask-status${existing.length ? ' is-ok' : ''}`;
+  status.textContent = existing.length ? '✓' : '';
+  status.setAttribute('aria-label', existing.length ? 'Đã có mask' : 'Chưa có mask');
+  status.title = existing.length ? `Đã có mask: ${existing.join(', ')}` : 'Chưa có mask cho key này';
+  const info = document.createElement('div');
+  info.className = 'wm-mask-info';
+  const name = document.createElement('span');
+  name.className = 'wm-mask-name';
+  name.textContent = `${model.label} · ${ratio}${res ? ` · ${res}` : ''}`;
+  const key = document.createElement('span');
+  key.className = 'wm-mask-key';
+  key.textContent = keys[0];
+  info.append(name, key);
+  const tools = document.createElement('div');
+  tools.className = 'wm-mask-tools';
+  const draw = makeButton('wm-mask-draw', 'Vẽ mask');
+  draw.title = existing.length ? 'Vẽ lại mask (ghi đè)' : 'Vẽ mask cho key này';
+  draw.addEventListener('click', () => openMaskEditorForKey(keys[0], ratio, model.base, model.id, res));
+  tools.append(draw);
+  if (existing.length) {
+    const remove = makeButton('wm-mask-delete', 'Xóa');
+    remove.addEventListener('click', () => wmDeleteKeys(existing));
+    tools.append(remove);
+  }
+  row.append(status, info, tools);
+  return row;
 }
 
-extendCancel.addEventListener('click', closeExtendDialog);
-extendDialog.addEventListener('click', (event) => {
-  if (event.composedPath()[0] === extendDialog) closeExtendDialog();
-});
-extendForm.addEventListener('submit', async (event) => {
-  event.preventDefault();
-  if (!extendState || extendSubmit.disabled) return;
-  const { projectId, item } = extendState;
-  const promptText = extendPrompt.value.trim();
-  if (!promptText) {
-    extendError.textContent = 'Prompt không được để trống.';
-    extendError.hidden = false;
-    return;
+function renderWmPanel() {
+  if (!wmInfo) return;
+  const engine = typeof wmInfo.engine === 'string' ? wmInfo.engine : 'disabled';
+  wmEngine.textContent = wmInfo.enabled
+    ? `Đang bật · engine: ${engine} · ${Array.isArray(wmInfo.masks) ? wmInfo.masks.length : 0} mask`
+    : 'Đang tắt (WATERMARK_ENABLED=0) — mask vẫn lưu được nhưng sẽ không được áp dụng';
+
+  const onlyActive = wmFilterActive.checked;
+  const activeModel = wmActiveModel();
+  const rows = [];
+  const knownKeys = new Set();
+  for (const model of wmImageModels()) {
+    const ratios = wmModelRatios(model);
+    if (onlyActive && activeModel && model.id !== activeModel.id) continue;
+    // WM layout khác nhau theo res (1K ≠ 2K) → mỗi res một dòng mask riêng.
+    const resList = Array.isArray(model.res) && model.res.length ? model.res : [null];
+    for (const ratio of ratios) {
+      for (const res of resList) rows.push(wmMaskRow(model, ratio, res));
+      for (const res of resList) {
+        for (const key of maskKeysFor(model.base, ratio, res)) {
+          // mask.key từ server đã sanitize — knownKeys phải cùng dạng mới lọc đúng
+          // danh sách "mask khác (legacy)", không dính mask của key hợp lệ.
+          knownKeys.add(sanitizeMaskKey(key));
+        }
+      }
+    }
   }
-  if (jobBusy(projectId)) {
-    extendError.textContent = 'Đang có job chạy — vui lòng đợi job hiện tại xong.';
-    extendError.hidden = false;
-    return;
-  }
-  extendSubmit.disabled = true;
-  const payload = {
-    mode: 'video',
-    model: 'veo-3.1-lite',
-    ratio: item.meta?.ratio ?? '16:9',
-    qty: 1,
-    res: null,
-    length: null,
-    vmode: 'extend',
-    extend_item_id: String(item.id),
-    references: [],
-    prompt: promptText,
-  };
-  closeExtendDialog();
-  const launched = await launchGeneration(
-    projects.find(({ id }) => id === projectId),
-    payload,
-    { clearPrompt: false },
-  );
-  if (launched) showToast('Đang tạo đoạn tiếp theo…');
+  wmMaskGrid.replaceChildren(...rows);
+  wmMaskGrid.hidden = rows.length === 0;
+
+  // Mask không khớp model/ratio nào (legacy, __global__…) — giữ để còn dọn dẹp.
+  const others = (Array.isArray(wmInfo.masks) ? wmInfo.masks : [])
+    .filter((mask) => !knownKeys.has(String(mask.key)));
+  wmOther.hidden = others.length === 0;
+  wmOtherCount.textContent = String(others.length);
+  wmOtherList.replaceChildren(...others.map((mask) => {
+    const li = document.createElement('li');
+    li.className = 'wm-mask-row';
+    const name = document.createElement('span');
+    name.className = 'wm-mask-key';
+    name.textContent = mask.key === '__global__' ? 'watermark.png (dùng chung)' : mask.key;
+    const remove = makeButton('wm-mask-delete', 'Xóa');
+    remove.addEventListener('click', () => wmDeleteKeys([String(mask.key)]));
+    li.append(name, remove);
+    return li;
+  }));
+}
+
+wmSettingsButton.addEventListener('click', () => {
+  openWmPanel();
 });
+wmClose.addEventListener('click', () => { wmModal.hidden = true; });
+wmModal.addEventListener('click', (event) => {
+  if (event.composedPath()[0] === wmModal) wmModal.hidden = true;
+});
+wmFilterActive.addEventListener('change', renderWmPanel);
