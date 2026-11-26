@@ -12,10 +12,21 @@
   <header class="topbar">
     <div class="brand">
       <span class="brand-mark" aria-hidden="true">VS</span>
-      <span>Video Studio Flow<span class="brand-divider" aria-hidden="true">/</span>CINEMAFLOW</span>
+      <span>Video Studio Flow</span>
+      <span class="brand-badge">CINEMAFLOW</span>
+      <span class="brand-sub">• Top-to-Bottom Genealogy Tree</span>
+      <span id="board-title" class="board-title"></span>
     </div>
     <div class="topbar-tools">
+      <span id="progress" class="progress" hidden></span>
       <span id="planner-badge" class="planner-badge" hidden></span>
+      <div class="zoom-group" role="group" aria-label="Thu phóng canvas">
+        <button id="zoom-out" type="button" title="Thu nhỏ (−)">−</button>
+        <button id="zoom-label" type="button" title="Về 100%">80%</button>
+        <button id="zoom-in" type="button" title="Phóng to (+)">+</button>
+        <button id="zoom-fit" type="button" title="Căn vừa màn hình">⛶</button>
+      </div>
+      <button id="rules-button" class="rules-button" type="button">◈ Quy tắc kịch bản</button>
       <a class="logout" href="/playground">← Playground</a>
     </div>
   </header>
@@ -31,63 +42,26 @@
     </div>
   </main>
 
-  <main id="app" class="studio" hidden>
-    <aside class="panel" aria-label="Cấu hình sản xuất">
-      <section class="panel-section">
-        <h2>GỐC GIA PHẢ</h2>
-        <label for="topic">Hôm nay sản xuất gì</label>
-        <textarea id="topic" rows="3" placeholder="Nhập bất kỳ chủ đề sáng tạo nào bạn muốn sản xuất...">Golden artisan pancakes, culinary perfection</textarea>
-        <label for="scene-count">Số lượng cảnh (N scenes): <output id="scene-count-out">8</output> cảnh</label>
-        <input id="scene-count" type="range" min="4" max="25" value="8">
-        <button id="plan-button" class="primary" type="button">✨ Lên kịch bản (Fan out N cảnh)</button>
-        <div class="btn-row">
-          <button id="import-button" class="ghost" type="button">Import JSON</button>
-          <button id="export-button" class="ghost" type="button">Export JSON</button>
-          <button id="reset-button" class="ghost danger" type="button">Xoá kịch bản</button>
-        </div>
-        <input id="import-file" type="file" accept="application/json,.json" hidden>
-      </section>
-
-      <section class="panel-section">
-        <h2>CẤU HÌNH SINH</h2>
-        <label for="image-model">Model tạo ảnh</label>
-        <select id="image-model"></select>
-        <label for="image-res">Res ảnh</label>
-        <select id="image-res"></select>
-        <label for="video-model">Mô hình tạo video (I2V First/Last)</label>
-        <select id="video-model"></select>
-        <p id="video-model-hint" class="hint"></p>
-      </section>
-
-      <section class="panel-section">
-        <h2>NÚT NHÂN VẬT</h2>
-        <p class="hint">Tối đa 2 ảnh nhân vật — mọi frame được sinh sẽ i2i tham chiếu.</p>
-        <ul id="character-list" class="character-list"></ul>
-        <div class="btn-row">
-          <select id="character-pick"><option value="">— Chọn ảnh từ project —</option></select>
-          <button id="character-add" class="ghost" type="button">Thêm</button>
-        </div>
-        <label class="file-drop hint" for="character-file">…hoặc tải ảnh lên (PNG/JPEG/WebP)</label>
-        <input id="character-file" type="file" accept="image/png,image/jpeg,image/webp" hidden>
-      </section>
-
-      <section class="panel-section">
-        <h2>QUY TRÌNH</h2>
-        <label class="check"><input id="auto-chain" type="checkbox" checked> Tự động tái dùng END trước làm START sau</label>
-        <label class="check"><input id="auto-run" type="checkbox"> Tự động gen ảnh tuần tự từng cảnh</label>
-        <button id="run-all" class="primary" type="button">▶ Sản xuất toàn bộ</button>
-        <p id="progress" class="hint"></p>
-      </section>
-    </aside>
-
-    <section class="board-wrap">
-      <div class="board-header">
-        <h1 id="board-title">Cây gia phả sản xuất chưa khởi tạo</h1>
-        <p id="board-sub">Nhập chủ đề rồi bấm "Lên kịch bản" — START → END → Video, đọc dọc từng cảnh.</p>
-      </div>
-      <div id="board" class="board"></div>
-    </section>
+  <main id="app" class="canvas-viewport" hidden>
+    <div id="world" class="canvas-world">
+      <svg id="edges" class="edges-svg" width="8000" height="6000" aria-hidden="true"></svg>
+      <!-- Toàn bộ node (root/config/character/video-config + các cột cảnh)
+           được studio.js dựng vào đây. -->
+    </div>
+    <div class="canvas-hint" id="canvas-hint">Kéo nền để di chuyển · lăn chuột để zoom · kéo tiêu đề thẻ để dời thẻ · bấm ⛶ để căn vừa</div>
   </main>
+
+  <dialog id="rules-dialog" class="rules-dialog">
+    <h2>◈ Quy tắc kịch bản</h2>
+    <ul>
+      <li><b>Cấu trúc:</b> S01 là Hook mở màn (3–5s), các cảnh thân phát triển liên tục, cảnh cuối là Reward trọn vẹn.</li>
+      <li><b>Liên tục:</b> cảnh S(n) kế thừa trạng thái kết thúc của S(n−1) — bật "Tự động tái dùng" để END trước thành START sau.</li>
+      <li><b>Khung hình:</b> 9:16 dọc, sáng viền đều, không vignette tối, không chữ/logo/watermark.</li>
+      <li><b>Thời lượng:</b> Omni 1.2 Flash 3–15s tuỳ cảnh; Veo 3.1 Lite 4/6/8s.</li>
+      <li><b>Chất lượng:</b> sống động kiểu live-action điện ảnh, sáng chuyên nghiệp, chi tiết sắc.</li>
+    </ul>
+    <button id="rules-close" class="primary" type="button">Đã hiểu</button>
+  </dialog>
 
   <div id="toast" class="toast" role="status" hidden></div>
 </body>
