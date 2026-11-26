@@ -1229,6 +1229,22 @@ def _resolve_dynamic_target(
         gen_config["imageSize"] = res.lower()
 
     if vmode == "frames":
+        # 2 ảnh (frame đầu + cuối): raw id trong /v1/models không mang metadata
+        # min/max images nên không phân biệt được key 1-1 hay 2-2 — đi theo
+        # catalog compose (lite → veo_3_1_interpolation_lite* 2-2, quality →
+        # veo_3_1_i2v_s* 1-2; đã verify upstream), trừ khi endpoint tự quảng bá
+        # variant i2v nhận 2 ảnh. Nếu không, 2 ảnh sẽ bị đẩy vào key i2v 1-1
+        # của upstream và từ chối ("first/last-frame model requires 1-1
+        # images; 2 provided") hoặc lệch duration (i2v chỉ có 4s/6s).
+        if image_count == 2:
+            admits_two = any(
+                item["images_minmax"] is not None and item["images_minmax"][1] >= 2
+                for item in meta["by_type"]["i2v"]
+            )
+            if not admits_two:
+                cat_two = _compose_video_frames_request(base, length, res, ratio, images=2)
+                if cat_two:
+                    return cat_two
         # Ưu tiên variant i2v thực của endpoint (khớp exact duration, thiếu thì chọn i2v gần nhất).
         matched = _pick_dynamic_video_variant(
             meta["by_type"]["i2v"], ratio, length, res, images=image_count, allow_nearest_duration=True

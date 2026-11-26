@@ -31,7 +31,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import generation, watermark
+from . import generation, studio, watermark
 from .config import (
     PLAYGROUND_MAX_RUNNING_JOBS,
     REFS_DIR,
@@ -970,3 +970,84 @@ async def playground_create_sample(
     finally:
         _sample_generating.discard(owner_hash)
     return _response(info)
+
+
+# ── Video Studio Flow (page riêng port từ tool CINEMAFLOW trên Flow) ─────
+#
+# Studio dùng lại toàn bộ pipeline generate của playground (job nền, refs,
+# watermark) qua project riêng "🎬 Video Studio Flow" — chỉ thêm planner
+# kịch bản (LLM qua env STUDIO_LLM_*, fallback engine deterministic) và
+# bootstrap project. Session/CSRF dùng chung với playground.
+
+STUDIO_PROJECT_NAME = "🎬 Video Studio Flow"
+
+
+@router.get("/studio", response_class=HTMLResponse, include_in_schema=False)
+async def studio_page():
+    return _static_page("studio.html")
+
+
+@router.get("/static/studio.js", include_in_schema=False)
+async def studio_script():
+    return _static_page("studio.js", "application/javascript")
+
+
+@router.get("/static/studio.css", include_in_schema=False)
+async def studio_stylesheet():
+    return _static_page("studio.css", "text/css")
+
+
+class StudioPlanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    topic: str = Field(min_length=1, max_length=500)
+    scene_count: int = Field(default=8, ge=4, le=25)
+
+
+class StudioImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # JSON export từ tool gốc trên Flow (hoặc từ studio này) — schema lỏng,
+    # studio.import_storyboard tự sanitize về chuẩn.
+    payload: dict
+    topic: str = Field(default="", max_length=500)
+
+
+@router.post("/playground/api/studio/plan", include_in_schema=False)
+async def studio_plan(
+    payload: StudioPlanRequest,
+    request: Request,
+    owner_hash: str = Security(_require_playground_owner),
+):
+    """Lên kịch bản N cảnh từ chủ đề — LLM (env STUDIO_LLM_*) hoặc template."""
+    await _require_playground_mutation(request, request.headers.get("x-playground-request"))
+    result = await studio.generate_storyboard_with_ai(payload.topic, payload.scene_count)
+    status_code = 200 if "storyboard" in result else 400
+    return _response(result, status_code=status_code)
+
+
+@router.post("/playground/api/studio/import", include_in_schema=False)
+async def studio_import(
+    payload: StudioImportRequest,
+    request: Request,
+    owner_hash: str = Security(_require_playground_owner),
+):
+    await _require_playground_mutation(request, request.headers.get("x-playground-request"))
+    return _response(studio.import_storyboard(payload.payload, payload.topic))
+
+
+@router.post("/playground/api/studio/workspace", include_in_schema=False)
+async def studio_workspace(
+    request: Request,
+    owner_hash: str = Security(_require_playground_owner),
+):
+    """Find-or-create project riêng của studio; trả project + flag cấu hình LLM."""
+    await _require_playground_mutation(request, request.headers.get("x-playground-request"))
+    projects = await playground_db.list_projects(owner_hash)
+    for project in projects:
+        if project.get("name") == STUDIO_PROJECT_NAME:
+            return _response({"project": project, "llm_ready": studio.llm_configured()})
+    project = await playground_db.create_project(
+        secrets.token_urlsafe(16), owner_hash, STUDIO_PROJECT_NAME, "", []
+    )
+    return _response({"project": project, "llm_ready": studio.llm_configured()})

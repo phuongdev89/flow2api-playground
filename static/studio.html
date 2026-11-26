@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Video Studio Flow · Playground</title>
+  <link rel="stylesheet" href="/static/studio.css">
+  <script type="module" src="/static/studio.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">VS</span>
+      <span>Video Studio Flow<span class="brand-divider" aria-hidden="true">/</span>CINEMAFLOW</span>
+    </div>
+    <div class="topbar-tools">
+      <span id="planner-badge" class="planner-badge" hidden></span>
+      <a class="logout" href="/playground">← Playground</a>
+    </div>
+  </header>
+
+  <!-- Session dùng chung playground (cookie path /playground) — chưa đăng nhập
+       thì không có form login riêng, dẫn về trang playground để nhập key. -->
+  <main id="gate" class="gate" hidden>
+    <div class="gate-card">
+      <h1>Video Studio Flow cần session playground</h1>
+      <p>Đăng nhập (API URL + API key) ở trang Playground — studio dùng chung phiên đó.</p>
+      <a class="primary" href="/playground">Mở trang Playground để đăng nhập</a>
+      <button id="gate-retry" class="ghost" type="button">Thử lại</button>
+    </div>
+  </main>
+
+  <main id="app" class="studio" hidden>
+    <aside class="panel" aria-label="Cấu hình sản xuất">
+      <section class="panel-section">
+        <h2>GỐC GIA PHẢ</h2>
+        <label for="topic">Hôm nay sản xuất gì</label>
+        <textarea id="topic" rows="3" placeholder="Nhập bất kỳ chủ đề sáng tạo nào bạn muốn sản xuất...">Golden artisan pancakes, culinary perfection</textarea>
+        <label for="scene-count">Số lượng cảnh (N scenes): <output id="scene-count-out">8</output> cảnh</label>
+        <input id="scene-count" type="range" min="4" max="25" value="8">
+        <button id="plan-button" class="primary" type="button">✨ Lên kịch bản (Fan out N cảnh)</button>
+        <div class="btn-row">
+          <button id="import-button" class="ghost" type="button">Import JSON</button>
+          <button id="export-button" class="ghost" type="button">Export JSON</button>
+          <button id="reset-button" class="ghost danger" type="button">Xoá kịch bản</button>
+        </div>
+        <input id="import-file" type="file" accept="application/json,.json" hidden>
+      </section>
+
+      <section class="panel-section">
+        <h2>CẤU HÌNH SINH</h2>
+        <label for="image-model">Model tạo ảnh</label>
+        <select id="image-model"></select>
+        <label for="image-res">Res ảnh</label>
+        <select id="image-res"></select>
+        <label for="video-model">Mô hình tạo video (I2V First/Last)</label>
+        <select id="video-model"></select>
+        <p id="video-model-hint" class="hint"></p>
+      </section>
+
+      <section class="panel-section">
+        <h2>NÚT NHÂN VẬT</h2>
+        <p class="hint">Tối đa 2 ảnh nhân vật — mọi frame được sinh sẽ i2i tham chiếu.</p>
+        <ul id="character-list" class="character-list"></ul>
+        <div class="btn-row">
+          <select id="character-pick"><option value="">— Chọn ảnh từ project —</option></select>
+          <button id="character-add" class="ghost" type="button">Thêm</button>
+        </div>
+        <label class="file-drop hint" for="character-file">…hoặc tải ảnh lên (PNG/JPEG/WebP)</label>
+        <input id="character-file" type="file" accept="image/png,image/jpeg,image/webp" hidden>
+      </section>
+
+      <section class="panel-section">
+        <h2>QUY TRÌNH</h2>
+        <label class="check"><input id="auto-chain" type="checkbox" checked> Tự động tái dùng END trước làm START sau</label>
+        <label class="check"><input id="auto-run" type="checkbox"> Tự động gen ảnh tuần tự từng cảnh</label>
+        <button id="run-all" class="primary" type="button">▶ Sản xuất toàn bộ</button>
+        <p id="progress" class="hint"></p>
+      </section>
+    </aside>
+
+    <section class="board-wrap">
+      <div class="board-header">
+        <h1 id="board-title">Cây gia phả sản xuất chưa khởi tạo</h1>
+        <p id="board-sub">Nhập chủ đề rồi bấm "Lên kịch bản" — START → END → Video, đọc dọc từng cảnh.</p>
+      </div>
+      <div id="board" class="board"></div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

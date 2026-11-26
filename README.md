@@ -19,6 +19,14 @@ vẽ tay)** và **crop viền WM video**.
 - **Job nền + hàng đợi** — job persist qua restart tab/server, stream kết quả
   từng item về ngay khi xong, cap số job chạy đồng thời
   (`PLAYGROUND_MAX_RUNNING_JOBS`).
+- **Video Studio Flow** (`/studio`) — port từ tool CINEMAFLOW trên labs.google
+  Flow: lên kịch bản N cảnh (4–25) từ một chủ đề, mỗi cảnh gen START/END frame
+  (i2i tham chiếu tối đa 2 ảnh nhân vật) rồi render video I2V First/Last
+  (Omni 1.2 Flash 3–15s hoặc Veo 3.1 Lite), tự động tái dùng END cảnh trước
+  làm START cảnh sau, Import/Export JSON tương thích hai chiều với tool gốc.
+  Dựng trên pipeline generate + job queue có sẵn; session dùng chung
+  playground. Planner kịch bản dùng LLM nếu điền `STUDIO_LLM_*`, không thì
+  engine mẫu nội bộ (4 template: kitchen/workshop/journey/cozy + universal).
 - **Projects** — mỗi project là một bảng kết quả lưu SQLite; đổi tên item,
   xóa hàng loạt (marquee selection), trim video (ffmpeg) tạo item mới.
 - **Mask xoá watermark** — xem chi tiết ở
@@ -55,6 +63,10 @@ Biến môi trường (đặt trong `.env` hoặc truyền thẳng):
 | `WATERMARK_VIDEO_CROP_PERCENT` | `2` | % crop mỗi cạnh cho video có WM viền |
 | `PLAYGROUND_MAX_RUNNING_JOBS` | `3` | Cap job generation chạy đồng thời mỗi owner |
 | `PLAYGROUND_RELOAD` | `1` | Uvicorn tự restart worker khi `app/*.py` đổi — sửa code không cần restart container. Đặt `0` cho prod. `static/` luôn đọc trực tiếp từ disk. |
+| `STUDIO_LLM_BASE_URL` | rỗng (= `FLOW2API_BASE_URL`) | Video Studio Flow: endpoint OpenAI-compatible cho planner LLM (`/v1/chat/completions`) |
+| `STUDIO_LLM_API_KEY` | rỗng | Bearer key của endpoint trên — **điền cặp này + model thì planner mới dùng LLM** |
+| `STUDIO_LLM_MODEL` | rỗng | Model id text cho planner (vd `gemini-3-pro`). Rỗng → engine mẫu nội bộ, không gọi LLM |
+| `STUDIO_LLM_TIMEOUT` | `120` | Timeout một request planner (giây) |
 
 **Đăng nhập** yêu cầu cả **API URL** (endpoint flow2api) và **API key**: cặp
 này được validate qua `GET /v1/models` trên chính endpoint đã nhập, đúng cả
