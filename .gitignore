@@ -24,3 +24,6 @@ __pycache__/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Phiên làm việc browser-skill / scratch agent (source extract, screenshot, log)
+.scratch/
