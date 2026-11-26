@@ -106,7 +106,12 @@ async function requestOr401(path, options) {
   const response = await request(path, options);
   if (response.status === 401 || response.status === 403) {
     showGate();
-    throw new Error('Phiên hết hạn — đăng nhập lại ở Playground.');
+    let detail = '';
+    try {
+      const data = await response.json();
+      if (data?.detail) detail = ` — ${data.detail}`;
+    } catch { /* body rỗng */ }
+    throw new Error(`Phiên hết hạn hoặc request bị chặn${detail}. Đăng nhập lại ở Playground.`);
   }
   return response;
 }
@@ -132,11 +137,10 @@ async function boot() {
     state.projectName = workspace.project.name;
     updatePlannerBadge(workspace.llm_ready);
     // Load lại project results (items có thể được tạo từ tab playground).
-    const projectResponse = await requestOr401(`/playground/api/projects/${state.projectId}`);
-    const project = await projectResponse.json();
-    state._projectResults = project.results || [];
+    const project = await fetchStudioProject();
+    state._projectResults = project?.results || [];
     indexItems(state._projectResults);
-    reconcileStateWithProject(project.results || []);
+    reconcileStateWithProject(state._projectResults);
   } catch (error) {
     toast(error.message, true);
     return;
@@ -157,11 +161,20 @@ async function boot() {
 
 function updatePlannerBadge(llmReady) {
   els.plannerBadge.hidden = false;
-  els.plannerBadge.textContent = llm_ready
+  els.plannerBadge.textContent = llmReady
     ? 'Planner: LLM (STUDIO_LLM_MODEL)'
     : 'Planner: engine mẫu (điền .env STUDIO_LLM_* để dùng LLM)';
   els.plannerBadge.classList.toggle('llm', llmReady);
   els.plannerBadge.classList.toggle('template', !llmReady);
+}
+
+async function fetchStudioProject() {
+  // Endpoint đơn /projects/{id} không tồn tại (405) — lấy qua list rồi find.
+  const response = await requestOr401('/playground/api/projects');
+  const projects = await response.json();
+  return (Array.isArray(projects) ? projects : []).find(
+    (project) => project.id === state.projectId,
+  ) || null;
 }
 
 // Item trong project có thể bị xoá từ tab playground — cắt tham chiếu chết.
@@ -365,8 +378,8 @@ function renderCharacters() {
 
 async function refreshCharacterPicker() {
   try {
-    const response = await requestOr401(`/playground/api/projects/${state.projectId}`);
-    const project = await response.json();
+    const project = await fetchStudioProject();
+    if (!project) return;
     const candidates = (project.results || []).filter(
       (item) => item.kind === 'image' && !state.characters.includes(String(item.id)),
     );

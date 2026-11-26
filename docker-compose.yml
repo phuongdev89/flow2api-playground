@@ -19,6 +19,12 @@ services:
       # Reload code: uvicorn tự restart worker khi app/*.py đổi — sửa code xong
       # không cần docker restart. Đặt PLAYGROUND_RELOAD=0 trong .env để tắt.
       PLAYGROUND_RELOAD: ${PLAYGROUND_RELOAD:-1}
+      # Video Studio Flow planner LLM — điền STUDIO_LLM_* trong .env để bật
+      # (rỗng = engine mẫu nội bộ). Đổi .env xong phải `docker compose up -d`.
+      STUDIO_LLM_BASE_URL: ${STUDIO_LLM_BASE_URL:-}
+      STUDIO_LLM_API_KEY: ${STUDIO_LLM_API_KEY:-}
+      STUDIO_LLM_MODEL: ${STUDIO_LLM_MODEL:-}
+      STUDIO_LLM_TIMEOUT: ${STUDIO_LLM_TIMEOUT:-120}
       TORCH_HUB_CACHE: /root/.cache/torch/hub
     volumes:
       - ./data:/app/data
