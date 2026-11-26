@@ -1,10 +1,13 @@
 // Video Studio Flow — canvas genealogy tree port vanilla JS từ tool CINEMAFLOW
-// trên labs.google Flow. Bố cục đúng tool gốc (computeInitialLayout):
+// trên labs.google Flow (nguồn port: bản 2026-11-26). Bố cục đúng tool gốc
+// (computeInitialLayout):
 //   hàng trên: [Cấu hình ảnh] [Nút nhân vật] [GỐC GIA PHẢ] [Cấu hình video]
 //   dưới root fan-out N cột, mỗi cột đọc dọc: BRANCH → START → END → VIDEO
 // Thẻ kéo được, canvas pan/zoom/fit, đường nối SVG dashed. Logic generation
-// (planner + job queue + chain END→START + import/export) dùng lại pipeline
-// playground y như trước.
+// (planner + job queue + chain END→START + import/export JSON) dùng lại pipeline
+// playground y như trước. Backup/Restore full-session theo node Backup &
+// Restore mới của tool (ảnh/video sống trong project playground nên backup
+// tham chiếu item id thay vì nhét base64 như bản Flow).
 
 const LS_KEY = 'studio_state_v1';
 const LS_CANVAS_KEY = 'studio_canvas_v1';
@@ -549,17 +552,29 @@ function buildRootNode() {
     <div class="range-ticks"><span>Tối thiểu 4</span><span>Mặc định 8</span><span>Tối đa 25</span></div>
     <button id="plan-button" class="primary plan-button" type="button">✨ Lên kịch bản (Fan out N cảnh)</button>
     <div class="btn-row">
+      <button id="backup-button" type="button">💾 Backup</button>
+      <button id="restore-button" type="button">♻️ Restore</button>
+    </div>
+    <div class="btn-row">
       <button id="import-button" type="button">Import JSON</button>
       <button id="export-button" type="button">Export JSON</button>
       <button id="reset-button" class="danger" type="button">Xoá kịch bản</button>
     </div>
-    <input id="import-file" type="file" accept="application/json,.json" hidden>`;
+    <input id="import-file" type="file" accept="application/json,.json" hidden>
+    <input id="restore-file" type="file" accept="application/json,.json" hidden>`;
   if (state.storyboard) $('topic').value = state.storyboard.topic || $('topic').value;
 
   $('scene-count').addEventListener('input', () => {
     $('scene-count-out').textContent = `${$('scene-count').value} cảnh`;
   });
   $('plan-button').addEventListener('click', plan);
+  $('backup-button').addEventListener('click', backupSession);
+  $('restore-button').addEventListener('click', () => $('restore-file').click());
+  $('restore-file').addEventListener('change', () => {
+    const file = $('restore-file').files?.[0];
+    $('restore-file').value = '';
+    if (file) restoreSession(file);
+  });
   $('import-button').addEventListener('click', () => $('import-file').click());
   $('import-file').addEventListener('change', () => {
     const file = $('import-file').files?.[0];
@@ -1090,6 +1105,134 @@ function resetBoard() {
   fitView();
   updateProgress();
   saveState();
+}
+
+// ── Backup / Restore full-session (node mới của tool bản 26-11) ─────────
+// Tool gốc nhét base64 ảnh/video vào backup; ở playground media sống trong
+// project (persist server-side) nên backup tham chiếu item id — nhẹ và
+// khôi phục đúng, chỉ mất refs nếu item đã bị xoá khỏi project.
+
+const BACKUP_SIGNATURE = 'CINEMAFLOW_TOOL_BACKUP_VALID_2026';
+
+function backupSession() {
+  if (!state.storyboard) { toast('Chưa có kịch bản để backup.', true); return; }
+  const payload = {
+    app: 'CINEMAFLOW_PLAYGROUND_PORT',
+    version: '2026-11-26',
+    signature: BACKUP_SIGNATURE,
+    createdAt: new Date().toISOString(),
+    manifest: {
+      topic: state.storyboard.topic,
+      sceneCount: state.storyboard.scenes.length,
+      imageModel: state.config.imageModel,
+      imageRes: state.config.imageRes,
+      videoModel: state.config.videoModel,
+      autoChain: state.config.autoChain,
+      autoRun: state.config.autoRun,
+      projectId: state.projectId,
+      nodePositions: state.nodePos,
+      transform: state.transform,
+    },
+    characters: state.characters.map((id) => ({ itemId: id })),
+    scenes: state.storyboard.scenes.map((plan, index) => ({
+      nodeId: plan.id,
+      plan,
+      startItemId: state.scenes[index]?.startItem || null,
+      endItemId: state.scenes[index]?.endItem || null,
+      videoItemId: state.scenes[index]?.videoItem || null,
+    })),
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `CINEMAFLOW_PLAYGROUND_backup_${new Date().toISOString().slice(0, 10)}.json`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+  toast('Đã tải file backup phiên làm việc.');
+}
+
+async function restoreSession(file) {
+  let raw;
+  try {
+    raw = JSON.parse(await file.text());
+  } catch {
+    toast('File backup không đọc được (JSON hỏng).', true);
+    return;
+  }
+  if (raw?.signature !== BACKUP_SIGNATURE) {
+    toast('File không phải backup của Video Studio Flow (sai chữ ký).', true);
+    return;
+  }
+  const manifest = raw.manifest || {};
+  const restoredScenes = Array.isArray(raw.scenes) ? raw.scenes : [];
+  if (!restoredScenes.length) { toast('Backup không có cảnh nào.', true); return; }
+
+  // Nhận diện item đã biến mất khỏi project (đã bị xoá) để báo đúng số lượng.
+  let projectItems = new Map();
+  try {
+    const project = await fetchStudioProject();
+    projectItems = new Map((project?.results || []).map((item) => [String(item.id), item]));
+  } catch { /* project fetch lỗi — restore vẫn chạy, refs chết sẽ bị cắt */ }
+
+  state.storyboard = {
+    topic: String(manifest.topic || ''),
+    category: 'restored',
+    totalDurationSeconds: restoredScenes.reduce(
+      (acc, scene) => acc + (Number(scene.plan?.durationSeconds) || 5), 0),
+    scenes: restoredScenes.map((scene, index) => ({
+      ...scene.plan,
+      id: scene.nodeId || `S${String(index + 1).padStart(2, '0')}`,
+    })),
+    dependencyExplanation: 'Phiên khôi phục từ file backup.',
+  };
+  state.scenes = restoredScenes.map((scene) => {
+    const pick = (id) => (id && projectItems.get(String(id)) ? String(id) : null);
+    return {
+      startItem: pick(scene.startItemId),
+      endItem: pick(scene.endItemId),
+      videoItem: pick(scene.videoItemId),
+      busy: false, error: null,
+    };
+  });
+  if (typeof manifest.imageModel === 'string' && manifest.imageModel) state.config.imageModel = manifest.imageModel;
+  if (typeof manifest.imageRes === 'string' && manifest.imageRes) state.config.imageRes = manifest.imageRes;
+  if (typeof manifest.videoModel === 'string' && manifest.videoModel) state.config.videoModel = manifest.videoModel;
+  if (typeof manifest.autoChain === 'boolean') state.config.autoChain = manifest.autoChain;
+  if (typeof manifest.autoRun === 'boolean') state.config.autoRun = manifest.autoRun;
+  state.characters = (raw.characters || [])
+    .map((character) => String(character.itemId || ''))
+    .filter((id) => id && projectItems.get(id));
+  if (manifest.nodePositions && typeof manifest.nodePositions === 'object') {
+    state.nodePos = manifest.nodePositions;
+  }
+  if (manifest.transform && typeof manifest.transform === 'object') {
+    state.transform = { ...state.transform, ...manifest.transform };
+  }
+  state._projectResults = [...projectItems.values()];
+  indexItems(state._projectResults);
+  reconcileStateWithProject(state._projectResults);
+
+  const topicBox = $('topic');
+  if (topicBox) topicBox.value = state.storyboard.topic || '';
+  els.boardTitle.textContent = `— ${state.storyboard.topic}`;
+  buildCanvas();
+  applyTransform();
+  fitView();
+  updateProgress();
+  saveState();
+
+  const missingFrames = restoredScenes.reduce((acc, scene, index) => {
+    const runtime = state.scenes[index];
+    return acc + (scene.startItemId && !runtime.startItem ? 1 : 0)
+      + (scene.endItemId && !runtime.endItem ? 1 : 0)
+      + (scene.videoItemId && !runtime.videoItem ? 1 : 0);
+  }, 0);
+  const missingChars = (raw.characters || []).length - state.characters.length;
+  const warn = missingFrames + missingChars > 0
+    ? ` — ${missingFrames + missingChars} media không còn trong project (bỏ qua).`
+    : '';
+  toast(`Khôi phục ${restoredScenes.length} cảnh${warn}`);
 }
 
 // ── Generation orchestration ────────────────────────────────────────────
