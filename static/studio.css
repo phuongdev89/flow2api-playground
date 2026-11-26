@@ -21,6 +21,15 @@
 
 * { box-sizing: border-box; }
 
+/* Chống bôi đen nội dung canvas/thẻ (trừ ô nhập — vẫn cần select để sửa). */
+body {
+  user-select: none;
+  -webkit-user-select: none;
+}
+input, textarea { user-select: text; -webkit-user-select: text; }
+/* Chống kéo-ghost ảnh khi rê thumbnail. */
+img, video { -webkit-user-drag: none; user-select: none; }
+
 /* `.gate`/`.canvas-viewport` đặt display riêng — rule này giữ attribute
    hidden luôn thắng. */
 [hidden] { display: none !important; }

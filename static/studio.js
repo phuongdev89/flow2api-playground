@@ -1322,6 +1322,17 @@ function updateProgress() {
 
 // ── Boot ────────────────────────────────────────────────────────────────
 
+// Chống phải chuột trên canvas/thẻ — trong ô nhập (topic/prompt) vẫn giữ
+// menu phải để copy/paste bình thường.
+document.addEventListener('contextmenu', (event) => {
+  if (event.target.closest('input, textarea')) return;
+  event.preventDefault();
+});
+// Chặn selectstart phòng engine không ăn user-select:none (loại trừ ô nhập).
+document.addEventListener('selectstart', (event) => {
+  if (!event.target.closest('input, textarea')) event.preventDefault();
+});
+
 // Lỗi script không được nuốt im lặng — hiện toast để thấy ngay khi UI gãy.
 window.addEventListener('error', (event) => {
   toast(`Lỗi script: ${event.message}`, true);
