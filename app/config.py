@@ -39,8 +39,10 @@ FLOW2API_BASE_URL = os.environ.get("FLOW2API_BASE_URL", "http://192.168.10.132:3
 # Timeout một request generation (video chạy lâu) — khớp JOB_MAX_WAIT_MS phía client.
 FLOW2API_TIMEOUT = _env_float("FLOW2API_TIMEOUT", 20 * 60)
 
-# ── Watermark (nằm ở playground, không còn ở flow2api) ──────────────────
-WATERMARK_ENABLED = _env_bool("WATERMARK_ENABLED", True)
+# ── Watermark — ĐÃ CHUYỂN VỀ flow2api gateway (per-token has_watermark).
+# Playground chỉ là client: ảnh tới đã sạch, mặc định KHÔNG xử lý gì nữa.
+# Bật lại chỉ khi dùng playground độc lập với gateway khác (env override).
+WATERMARK_ENABLED = _env_bool("WATERMARK_ENABLED", False)
 # auto = LaMa nếu cài được, fallback OpenCV TELEA.
 WATERMARK_ENGINE = os.environ.get("WATERMARK_ENGINE", "auto").strip().lower()
 WATERMARK_MASK_DIR = os.environ.get("WATERMARK_MASK_DIR", "masks")
@@ -60,3 +62,18 @@ PLAYGROUND_MAX_RUNNING_JOBS = _env_int("PLAYGROUND_MAX_RUNNING_JOBS", 3)
 # Cap ảnh tham chiếu: image i2i cho phép 10, video ingredients upstream chỉ
 # xác nhận tới 3 nên giữ 3 để không đốt quota tổ hợp thất bại.
 MAX_REFERENCE_IMAGES = {"image": 10, "video": 3}
+
+# ── Video Studio Flow (planner kịch bản) ────────────────────────────────
+# Planner LLM dùng endpoint OpenAI-compatible riêng (/v1/chat/completions).
+# Đặt rỗng → studio dùng engine deterministic nội bộ (4 template), không gọi
+# LLM. Điền .env sau khi có endpoint text model:
+#   STUDIO_LLM_BASE_URL : URL gốc (vd http://host:port; mặc định dùng luôn
+#                         FLOW2API_BASE_URL nếu bỏ trống)
+#   STUDIO_LLM_API_KEY  : Bearer key của endpoint trên
+#   STUDIO_LLM_MODEL    : model id text (vd gemini-3-pro / gpt-4o-mini...)
+STUDIO_LLM_BASE_URL = os.environ.get("STUDIO_LLM_BASE_URL", "").strip().rstrip("/") or FLOW2API_BASE_URL
+STUDIO_LLM_API_KEY = os.environ.get("STUDIO_LLM_API_KEY", "").strip()
+STUDIO_LLM_MODEL = os.environ.get("STUDIO_LLM_MODEL", "").strip()
+# Timeout một request planner (LLM viết kịch bản N cảnh chạy nhanh, không cần
+# bằng timeout generation video).
+STUDIO_LLM_TIMEOUT = _env_float("STUDIO_LLM_TIMEOUT", 120)

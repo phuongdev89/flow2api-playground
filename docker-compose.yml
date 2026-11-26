@@ -11,7 +11,8 @@ services:
     environment:
       # Engine generation — trỏ sang container/host flow2api đang chạy.
       FLOW2API_BASE_URL: ${FLOW2API_BASE_URL:-http://192.168.10.132:38000}
-      WATERMARK_ENABLED: ${WATERMARK_ENABLED:-1}
+      # WM đã chuyển về flow2api gateway (per-token) — mặc định TẮT ở playground
+      WATERMARK_ENABLED: ${WATERMARK_ENABLED:-0}
       WATERMARK_ENGINE: ${WATERMARK_ENGINE:-auto}
       WATERMARK_VIDEO_CROP_PERCENT: ${WATERMARK_VIDEO_CROP_PERCENT:-2}
       PLAYGROUND_MAX_RUNNING_JOBS: ${PLAYGROUND_MAX_RUNNING_JOBS:-3}
